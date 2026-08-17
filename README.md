@@ -13,19 +13,19 @@ zsh build.sh
 Set `XCODE_APP=/path/to/Xcode.app` if Xcode 27 is installed under a name the
 script cannot discover.
 
-Boot at least two iOS simulators, then launch all booted iOS simulators with:
+Launch the host with:
 
 ```sh
 zsh run.sh
 ```
 
-To choose specific simulators, pass two or more UDIDs:
+The window checks for booted iOS simulators every two seconds. Simulators opened
+in Device Hub appear automatically, and panes disappear when their simulators
+shut down.
 
-```sh
-zsh run.sh \
-  A9D7B15B-BD4D-4EB3-A847-DED87DEE35C4 \
-  20A4F6B7-04E3-43CB-918D-23269FE26217
-```
+Each pane shows the simulator name, runtime, and abbreviated UDID. Drag its
+title bar to position it anywhere in the window, or drag its lower-right handle
+to resize it.
 
 The implementation relies on private, unsupported Xcode APIs and may require
 updates for every Xcode build.
