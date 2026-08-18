@@ -21,13 +21,13 @@ private struct DeviceInfo: Identifiable, Equatable, Sendable {
     let id: DeviceIdentifier
     let name: String
     let runtime: String
-    let recordingSize: String?
+    let screenAspectRatio: CGFloat?
 
-    init(id: DeviceIdentifier, name: String, runtime: String, recordingSize: String? = nil) {
+    init(id: DeviceIdentifier, name: String, runtime: String, screenAspectRatio: CGFloat? = nil) {
         self.id = id
         self.name = name
         self.runtime = runtime
-        self.recordingSize = recordingSize
+        self.screenAspectRatio = screenAspectRatio
     }
 
     var shortIdentifier: String {
@@ -67,6 +67,7 @@ private enum IOSSimulatorDiscovery {
         let udid: String
         let state: String
         let isAvailable: Bool?
+        let deviceTypeIdentifier: String
     }
 
     static func bootedSimulators() async throws -> [DeviceInfo] {
@@ -110,7 +111,8 @@ private enum IOSSimulatorDiscovery {
                     simulatorsByIdentifier[identifier] = DeviceInfo(
                         id: .ios(identifier),
                         name: record.name,
-                        runtime: runtime
+                        runtime: runtime,
+                        screenAspectRatio: record.deviceTypeIdentifier.contains(".iPad-") ? 0.75 : 0.46
                     )
                 }
             }
@@ -196,8 +198,7 @@ private final class WorkspaceModel: ObservableObject {
                         DeviceInfo(
                             id: .android($0.serial),
                             name: $0.name,
-                            runtime: $0.runtime,
-                            recordingSize: $0.recordingSize
+                            runtime: $0.runtime
                         )
                     })
                 } catch {
@@ -387,28 +388,49 @@ private struct DeviceWorkspaceView: View {
 
 private struct ScaledDeviceView: View {
     let deviceIdentifier: UUID
+    let screenAspectRatio: CGFloat
 
     @State private var referenceSize: CGSize?
 
     var body: some View {
-        GeometryReader { geometry in
-            let sourceSize = referenceSize ?? geometry.size
-            let widthScale = sourceSize.width > 0 ? geometry.size.width / sourceSize.width : 1
-            let heightScale = sourceSize.height > 0 ? geometry.size.height / sourceSize.height : 1
+        GeometryReader { container in
+            let fittedSize = aspectFit(screenAspectRatio, in: container.size)
+            let sourceSize = referenceSize ?? container.size
+            let naturalSize = aspectFill(screenAspectRatio, in: sourceSize)
+            let widthScale = naturalSize.width > 0 ? fittedSize.width / naturalSize.width : 1
+            let heightScale = naturalSize.height > 0 ? fittedSize.height / naturalSize.height : 1
 
             DeviceView(deviceIdentifier: deviceIdentifier)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: sourceSize.width, height: sourceSize.height)
+                .frame(width: naturalSize.width, height: naturalSize.height)
                 .scaleEffect(min(widthScale, heightScale))
-                .frame(width: geometry.size.width, height: geometry.size.height)
-                .onChange(of: geometry.size, initial: true) { _, size in
+                .frame(width: container.size.width, height: container.size.height)
+                .onChange(of: container.size, initial: true) { _, size in
                     guard referenceSize == nil, size.width > 0, size.height > 0 else {
                         return
                     }
-
                     referenceSize = size
                 }
         }
+    }
+
+    private func aspectFit(_ aspectRatio: CGFloat, in size: CGSize) -> CGSize {
+        guard size.width > 0, size.height > 0 else {
+            return .zero
+        }
+        if size.width / size.height > aspectRatio {
+            return CGSize(width: size.height * aspectRatio, height: size.height)
+        }
+        return CGSize(width: size.width, height: size.width / aspectRatio)
+    }
+
+    private func aspectFill(_ aspectRatio: CGFloat, in size: CGSize) -> CGSize {
+        guard size.width > 0, size.height > 0 else {
+            return .zero
+        }
+        if size.width / size.height > aspectRatio {
+            return CGSize(width: size.width, height: size.width / aspectRatio)
+        }
+        return CGSize(width: size.height * aspectRatio, height: size.height)
     }
 }
 
@@ -462,12 +484,12 @@ private struct DevicePane: View {
     private var deviceScreen: some View {
         switch device.id {
         case .ios(let identifier):
-            ScaledDeviceView(deviceIdentifier: identifier)
-        case .android(let serial):
-            AndroidEmulatorView(
-                serial: serial,
-                recordingSize: device.recordingSize ?? "720x1280"
+            ScaledDeviceView(
+                deviceIdentifier: identifier,
+                screenAspectRatio: device.screenAspectRatio ?? 0.46
             )
+        case .android(let serial):
+            AndroidEmulatorView(serial: serial)
         }
     }
 

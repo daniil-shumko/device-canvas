@@ -21,6 +21,13 @@ Android Studio's default `~/Library/Android/sdk` location. Only running emulator
 serials backed by a local Android Studio AVD are included; physical Android
 devices and third-party emulators are ignored.
 
+Android display and input use scrcpy 4.1. Install it with Homebrew before
+launching Device Canvas:
+
+```sh
+brew install scrcpy
+```
+
 Launch the host with:
 
 ```sh
@@ -33,8 +40,10 @@ shut down.
 
 Each pane shows the device name, runtime, and abbreviated identifier. Drag its
 title bar to position it anywhere in the window, or drag its lower-right handle
-to resize it. Android screens are streamed through `adb screenrecord` and
-decoded by macOS without third-party mirroring software.
+to resize it. Android screens are streamed through scrcpy and decoded by macOS.
+Click or drag inside an Android pane to send touch input, scroll normally, and
+type after selecting the pane. Right-click sends Back and middle-click sends
+Home.
 
 The implementation relies on private, unsupported Xcode APIs and may require
 updates for every Xcode build.
