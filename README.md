@@ -1,10 +1,10 @@
-# Sesori Station
+# Device Canvas
 
-The device station for mobile devs.
+A freeform workspace for mobile devices, simulators, and emulators.
 
-This project currently tests whether Xcode 27's private `DeviceKit.framework`
-can render multiple interactive simulator views side by side in one macOS
-window. It does not modify Xcode or Device Hub.
+Device Canvas is an experimental macOS app for arranging multiple interactive
+device screens in one window. It currently supports booted iOS simulators using
+Xcode 27's private `DeviceKit.framework`. It does not modify Xcode or Device Hub.
 
 Build with the Xcode 27 beta installed at the default path:
 

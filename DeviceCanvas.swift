@@ -505,7 +505,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
 
-        window.title = "Device Hub Tiler"
+        window.title = "Device Canvas"
         window.contentMinSize = NSSize(width: 700, height: 500)
         window.contentView = NSHostingView(rootView: SimulatorWorkspaceView(model: workspaceModel))
         window.center()
@@ -526,7 +526,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-private enum DeviceHubTiler {
+private enum DeviceCanvas {
     @MainActor
     static func main() {
         let initialIdentifiers = CommandLine.arguments.dropFirst().compactMap(UUID.init(uuidString:))

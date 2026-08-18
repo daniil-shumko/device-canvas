@@ -17,7 +17,7 @@ DEVELOPER_DIR="$XCODE_APP/Contents/Developer"
 FRAMEWORKS="$XCODE_APP/Contents/SharedFrameworks"
 BUILD_DIR="$ROOT/.build"
 MODULE_DIR="$BUILD_DIR/modules"
-APP="$BUILD_DIR/DeviceHubTiler.app"
+APP="$BUILD_DIR/DeviceCanvas.app"
 CONTENTS="$APP/Contents"
 
 if [[ ! -d "$XCODE_APP" ]]; then
@@ -43,7 +43,7 @@ DEVELOPER_DIR="$DEVELOPER_DIR" xcrun swiftc \
     -target arm64-apple-macos26.4
 
 DEVELOPER_DIR="$DEVELOPER_DIR" xcrun swiftc \
-    "$ROOT/DeviceHubTiler.swift" \
+    "$ROOT/DeviceCanvas.swift" \
     -parse-as-library \
     -I "$MODULE_DIR" \
     -F "$FRAMEWORKS" \
@@ -52,7 +52,7 @@ DEVELOPER_DIR="$DEVELOPER_DIR" xcrun swiftc \
     -Xlinker "$FRAMEWORKS" \
     -sdk "$SDK" \
     -target arm64-apple-macos26.4 \
-    -o "$CONTENTS/MacOS/DeviceHubTiler"
+    -o "$CONTENTS/MacOS/DeviceCanvas"
 
 cp "$ROOT/Info.plist" "$CONTENTS/Info.plist"
 codesign --force --sign - "$APP"

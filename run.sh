@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=${0:A:h}
-APP="$ROOT/.build/DeviceHubTiler.app"
+APP="$ROOT/.build/DeviceCanvas.app"
 
 if [[ ! -d "$APP" ]]; then
     zsh "$ROOT/build.sh"
