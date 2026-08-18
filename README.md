@@ -1,8 +1,10 @@
-# Device Hub Tiler experiment
+# Sesori Station
 
-This project tests whether Xcode 27's private `DeviceKit.framework` can render
-multiple interactive simulator views side by side in one macOS window. It does
-not modify Xcode or Device Hub.
+The device station for mobile devs.
+
+This project currently tests whether Xcode 27's private `DeviceKit.framework`
+can render multiple interactive simulator views side by side in one macOS
+window. It does not modify Xcode or Device Hub.
 
 Build with the Xcode 27 beta installed at the default path:
 
