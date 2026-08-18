@@ -333,6 +333,33 @@ private struct SimulatorWorkspaceView: View {
     }
 }
 
+private struct ScaledDeviceView: View {
+    let deviceIdentifier: UUID
+
+    @State private var referenceSize: CGSize?
+
+    var body: some View {
+        GeometryReader { geometry in
+            let sourceSize = referenceSize ?? geometry.size
+            let widthScale = sourceSize.width > 0 ? geometry.size.width / sourceSize.width : 1
+            let heightScale = sourceSize.height > 0 ? geometry.size.height / sourceSize.height : 1
+
+            DeviceView(deviceIdentifier: deviceIdentifier)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: sourceSize.width, height: sourceSize.height)
+                .scaleEffect(min(widthScale, heightScale))
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .onChange(of: geometry.size, initial: true) { _, size in
+                    guard referenceSize == nil, size.width > 0, size.height > 0 else {
+                        return
+                    }
+
+                    referenceSize = size
+                }
+        }
+    }
+}
+
 private struct SimulatorPane: View {
     let simulator: SimulatorInfo
     let layout: PaneLayout
@@ -352,8 +379,7 @@ private struct SimulatorPane: View {
             ZStack {
                 Color.black.opacity(0.22)
 
-                DeviceView(deviceIdentifier: simulator.id)
-                    .aspectRatio(contentMode: .fit)
+                ScaledDeviceView(deviceIdentifier: simulator.id)
                     .padding(8)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
