@@ -44,6 +44,7 @@ DEVELOPER_DIR="$DEVELOPER_DIR" xcrun swiftc \
 
 DEVELOPER_DIR="$DEVELOPER_DIR" xcrun swiftc \
     "$ROOT/DeviceCanvas.swift" \
+    "$ROOT/AndroidEmulator.swift" \
     -parse-as-library \
     -I "$MODULE_DIR" \
     -F "$FRAMEWORKS" \

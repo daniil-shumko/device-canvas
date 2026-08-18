@@ -3,13 +3,40 @@ import DeviceKit
 import Foundation
 import SwiftUI
 
-private struct SimulatorInfo: Identifiable, Equatable, Sendable {
-    let id: UUID
+private enum DeviceIdentifier: Hashable, Sendable {
+    case ios(UUID)
+    case android(String)
+
+    var stableValue: String {
+        switch self {
+        case .ios(let identifier):
+            "ios-\(identifier.uuidString)"
+        case .android(let serial):
+            "android-\(serial)"
+        }
+    }
+}
+
+private struct DeviceInfo: Identifiable, Equatable, Sendable {
+    let id: DeviceIdentifier
     let name: String
     let runtime: String
+    let recordingSize: String?
+
+    init(id: DeviceIdentifier, name: String, runtime: String, recordingSize: String? = nil) {
+        self.id = id
+        self.name = name
+        self.runtime = runtime
+        self.recordingSize = recordingSize
+    }
 
     var shortIdentifier: String {
-        String(id.uuidString.prefix(8))
+        switch id {
+        case .ios(let identifier):
+            String(identifier.uuidString.prefix(8))
+        case .android(let serial):
+            serial
+        }
     }
 }
 
@@ -30,7 +57,7 @@ private enum SimulatorDiscoveryError: LocalizedError {
     }
 }
 
-private enum SimulatorDiscovery {
+private enum IOSSimulatorDiscovery {
     private struct Response: Decodable {
         let devices: [String: [DeviceRecord]]
     }
@@ -42,7 +69,7 @@ private enum SimulatorDiscovery {
         let isAvailable: Bool?
     }
 
-    static func bootedIOSSimulators() async throws -> [SimulatorInfo] {
+    static func bootedSimulators() async throws -> [DeviceInfo] {
         let developerDirectory = deviceKitDeveloperDirectory
 
         return try await Task.detached(priority: .utility) {
@@ -68,7 +95,7 @@ private enum SimulatorDiscovery {
             }
 
             let response = try JSONDecoder().decode(Response.self, from: data)
-            var simulatorsByIdentifier: [UUID: SimulatorInfo] = [:]
+            var simulatorsByIdentifier: [UUID: DeviceInfo] = [:]
 
             for (runtimeIdentifier, records) in response.devices
             where runtimeIdentifier.contains(".SimRuntime.iOS-") {
@@ -80,8 +107,8 @@ private enum SimulatorDiscovery {
                         continue
                     }
 
-                    simulatorsByIdentifier[identifier] = SimulatorInfo(
-                        id: identifier,
+                    simulatorsByIdentifier[identifier] = DeviceInfo(
+                        id: .ios(identifier),
                         name: record.name,
                         runtime: runtime
                     )
@@ -89,7 +116,7 @@ private enum SimulatorDiscovery {
             }
 
             return simulatorsByIdentifier.values.sorted {
-                ($0.name, $0.runtime, $0.id.uuidString) < ($1.name, $1.runtime, $1.id.uuidString)
+                ($0.name, $0.runtime, $0.id.stableValue) < ($1.name, $1.runtime, $1.id.stableValue)
             }
         }.value
     }
@@ -124,8 +151,8 @@ private enum SimulatorDiscovery {
 private final class WorkspaceModel: ObservableObject {
     static let minimumPaneSize = CGSize(width: 240, height: 360)
 
-    @Published private(set) var simulators: [SimulatorInfo]
-    @Published private(set) var layouts: [UUID: PaneLayout] = [:]
+    @Published private(set) var devices: [DeviceInfo]
+    @Published private(set) var layouts: [DeviceIdentifier: PaneLayout] = [:]
     @Published private(set) var discoveryError: String?
 
     private var canvasSize = CGSize.zero
@@ -134,8 +161,12 @@ private final class WorkspaceModel: ObservableObject {
     private var monitoringTask: Task<Void, Never>?
 
     init(initialIdentifiers: [UUID]) {
-        simulators = initialIdentifiers.map {
-            SimulatorInfo(id: $0, name: "Simulator \(String($0.uuidString.prefix(8)))", runtime: "Starting")
+        devices = initialIdentifiers.map {
+            DeviceInfo(
+                id: .ios($0),
+                name: "Simulator \(String($0.uuidString.prefix(8)))",
+                runtime: "Starting"
+            )
         }
     }
 
@@ -146,20 +177,41 @@ private final class WorkspaceModel: ObservableObject {
 
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
+                let existingDevices = self?.devices ?? []
+                var discovered: [DeviceInfo] = []
+                var errors: [String] = []
+
                 do {
-                    let discovered = try await SimulatorDiscovery.bootedIOSSimulators()
-                    guard !Task.isCancelled else {
-                        return
-                    }
-
-                    self?.reconcile(discovered)
+                    discovered.append(contentsOf: try await IOSSimulatorDiscovery.bootedSimulators())
                 } catch {
-                    guard !Task.isCancelled else {
-                        return
-                    }
-
-                    self?.discoveryError = error.localizedDescription
+                    discovered.append(contentsOf: existingDevices.filter {
+                        if case .ios = $0.id { true } else { false }
+                    })
+                    errors.append(error.localizedDescription)
                 }
+
+                do {
+                    let androidEmulators = try await AndroidEmulatorDiscovery.runningEmulators()
+                    discovered.append(contentsOf: androidEmulators.map {
+                        DeviceInfo(
+                            id: .android($0.serial),
+                            name: $0.name,
+                            runtime: $0.runtime,
+                            recordingSize: $0.recordingSize
+                        )
+                    })
+                } catch {
+                    discovered.append(contentsOf: existingDevices.filter {
+                        if case .android = $0.id { true } else { false }
+                    })
+                    errors.append(error.localizedDescription)
+                }
+
+                guard !Task.isCancelled else {
+                    return
+                }
+
+                self?.reconcile(discovered, errors: errors)
 
                 do {
                     try await Task.sleep(for: .seconds(2))
@@ -180,11 +232,11 @@ private final class WorkspaceModel: ObservableObject {
         ensureLayouts()
     }
 
-    func layout(for identifier: UUID) -> PaneLayout? {
+    func layout(for identifier: DeviceIdentifier) -> PaneLayout? {
         layouts[identifier]
     }
 
-    func bringToFront(_ identifier: UUID) {
+    func bringToFront(_ identifier: DeviceIdentifier) {
         guard var layout = layouts[identifier], layout.zIndex < highestZIndex else {
             return
         }
@@ -194,7 +246,7 @@ private final class WorkspaceModel: ObservableObject {
         layouts[identifier] = layout
     }
 
-    func movePane(_ identifier: UUID, to proposedOrigin: CGPoint) {
+    func movePane(_ identifier: DeviceIdentifier, to proposedOrigin: CGPoint) {
         guard var layout = layouts[identifier] else {
             return
         }
@@ -203,7 +255,7 @@ private final class WorkspaceModel: ObservableObject {
         layouts[identifier] = layout
     }
 
-    func resizePane(_ identifier: UUID, to proposedSize: CGSize) {
+    func resizePane(_ identifier: DeviceIdentifier, to proposedSize: CGSize) {
         guard var layout = layouts[identifier] else {
             return
         }
@@ -217,15 +269,15 @@ private final class WorkspaceModel: ObservableObject {
         layouts[identifier] = layout
     }
 
-    private func reconcile(_ discovered: [SimulatorInfo]) {
+    private func reconcile(_ discovered: [DeviceInfo], errors: [String]) {
         var remaining = Dictionary(uniqueKeysWithValues: discovered.map { ($0.id, $0) })
-        var updated = simulators.compactMap { remaining.removeValue(forKey: $0.id) }
+        var updated = devices.compactMap { remaining.removeValue(forKey: $0.id) }
         updated.append(contentsOf: remaining.values.sorted {
-            ($0.name, $0.runtime, $0.id.uuidString) < ($1.name, $1.runtime, $1.id.uuidString)
+            ($0.name, $0.runtime, $0.id.stableValue) < ($1.name, $1.runtime, $1.id.stableValue)
         })
 
-        simulators = updated
-        discoveryError = nil
+        devices = updated
+        discoveryError = errors.isEmpty ? nil : errors.joined(separator: "\n")
         ensureLayouts()
     }
 
@@ -236,7 +288,7 @@ private final class WorkspaceModel: ObservableObject {
 
         let margin = 24.0
         let spacing = 24.0
-        let paneCount = max(simulators.count, 1)
+        let paneCount = max(devices.count, 1)
         let maximumColumns = max(
             1,
             Int((canvasSize.width - margin * 2 + spacing) / (Self.minimumPaneSize.width + spacing))
@@ -251,7 +303,7 @@ private final class WorkspaceModel: ObservableObject {
         let gridWidth = CGFloat(columns) * paneWidth + CGFloat(columns - 1) * spacing
         let gridOriginX = max(margin, (canvasSize.width - gridWidth) / 2)
 
-        for simulator in simulators where layouts[simulator.id] == nil {
+        for device in devices where layouts[device.id] == nil {
             let column = nextPlacementIndex % columns
             let row = nextPlacementIndex / columns
             let proposedOrigin = CGPoint(
@@ -260,7 +312,7 @@ private final class WorkspaceModel: ObservableObject {
             )
 
             highestZIndex += 1
-            layouts[simulator.id] = PaneLayout(
+            layouts[device.id] = PaneLayout(
                 origin: clampedOrigin(proposedOrigin, paneSize: paneSize),
                 size: paneSize,
                 zIndex: highestZIndex
@@ -277,7 +329,7 @@ private final class WorkspaceModel: ObservableObject {
     }
 }
 
-private struct SimulatorWorkspaceView: View {
+private struct DeviceWorkspaceView: View {
     @ObservedObject var model: WorkspaceModel
 
     var body: some View {
@@ -285,19 +337,19 @@ private struct SimulatorWorkspaceView: View {
             ZStack(alignment: .topLeading) {
                 Color(nsColor: .windowBackgroundColor)
 
-                if model.simulators.isEmpty {
+                if model.devices.isEmpty {
                     emptyState
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
 
-                ForEach(model.simulators) { simulator in
-                    if let layout = model.layout(for: simulator.id) {
-                        SimulatorPane(
-                            simulator: simulator,
+                ForEach(model.devices) { device in
+                    if let layout = model.layout(for: device.id) {
+                        DevicePane(
+                            device: device,
                             layout: layout,
-                            onActivate: { model.bringToFront(simulator.id) },
-                            onMove: { model.movePane(simulator.id, to: $0) },
-                            onResize: { model.resizePane(simulator.id, to: $0) }
+                            onActivate: { model.bringToFront(device.id) },
+                            onMove: { model.movePane(device.id, to: $0) },
+                            onResize: { model.resizePane(device.id, to: $0) }
                         )
                         .offset(x: layout.origin.x, y: layout.origin.y)
                         .zIndex(layout.zIndex)
@@ -317,9 +369,9 @@ private struct SimulatorWorkspaceView: View {
             Image(systemName: "rectangle.3.group")
                 .font(.system(size: 42, weight: .light))
                 .foregroundStyle(.secondary)
-            Text("Start an iOS simulator in Device Hub")
+            Text("Start a simulator or emulator")
                 .font(.title3.weight(.semibold))
-            Text("Booted simulators appear here automatically.")
+            Text("Booted iOS simulators and Android Studio emulators appear here automatically.")
                 .foregroundStyle(.secondary)
 
             if let discoveryError = model.discoveryError {
@@ -360,8 +412,8 @@ private struct ScaledDeviceView: View {
     }
 }
 
-private struct SimulatorPane: View {
-    let simulator: SimulatorInfo
+private struct DevicePane: View {
+    let device: DeviceInfo
     let layout: PaneLayout
     let onActivate: () -> Void
     let onMove: (CGPoint) -> Void
@@ -379,7 +431,7 @@ private struct SimulatorPane: View {
             ZStack {
                 Color.black.opacity(0.22)
 
-                ScaledDeviceView(deviceIdentifier: simulator.id)
+                deviceScreen
                     .padding(8)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -406,6 +458,19 @@ private struct SimulatorPane: View {
         )
     }
 
+    @ViewBuilder
+    private var deviceScreen: some View {
+        switch device.id {
+        case .ios(let identifier):
+            ScaledDeviceView(deviceIdentifier: identifier)
+        case .android(let serial):
+            AndroidEmulatorView(
+                serial: serial,
+                recordingSize: device.recordingSize ?? "720x1280"
+            )
+        }
+    }
+
     private var titleBar: some View {
         HStack(spacing: 10) {
             Circle()
@@ -413,10 +478,10 @@ private struct SimulatorPane: View {
                 .frame(width: 8, height: 8)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(simulator.name)
+                Text(device.name)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
-                Text("\(simulator.runtime) - \(simulator.shortIdentifier)")
+                Text("\(device.runtime) - \(device.shortIdentifier)")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -434,8 +499,8 @@ private struct SimulatorPane: View {
         .background(Color.primary.opacity(0.055))
         .gesture(moveGesture)
         .help("Drag to move")
-        .accessibilityLabel("Move \(simulator.name)")
-        .accessibilityIdentifier("pane-title-\(simulator.id.uuidString)")
+        .accessibilityLabel("Move \(device.name)")
+        .accessibilityIdentifier("pane-title-\(device.id.stableValue)")
     }
 
     private var resizeHandle: some View {
@@ -448,8 +513,8 @@ private struct SimulatorPane: View {
             .padding(6)
             .gesture(resizeGesture)
             .help("Drag to resize")
-            .accessibilityLabel("Resize \(simulator.name)")
-            .accessibilityIdentifier("pane-resize-\(simulator.id.uuidString)")
+            .accessibilityLabel("Resize \(device.name)")
+            .accessibilityIdentifier("pane-resize-\(device.id.stableValue)")
     }
 
     private var moveGesture: some Gesture {
@@ -507,7 +572,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
         window.title = "Device Canvas"
         window.contentMinSize = NSSize(width: 700, height: 500)
-        window.contentView = NSHostingView(rootView: SimulatorWorkspaceView(model: workspaceModel))
+        window.contentView = NSHostingView(rootView: DeviceWorkspaceView(model: workspaceModel))
         window.center()
         window.makeKeyAndOrderFront(nil)
         self.window = window
