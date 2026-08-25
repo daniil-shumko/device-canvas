@@ -36,7 +36,7 @@ zsh run.sh
 
 The window checks for booted iOS simulators and running Android Studio emulators
 every two seconds. Devices appear automatically, and panes disappear when they
-shut down.
+shut down unless a Sesori session owns them.
 
 Each pane shows the device name, runtime, and abbreviated identifier. Drag its
 title bar to position it anywhere in the window, or drag its lower-right handle
@@ -44,6 +44,17 @@ to resize it. Android screens are streamed through scrcpy and decoded by macOS.
 Click or drag inside an Android pane to send touch input, scroll normally, and
 type after selecting the pane. Right-click sends Back and middle-click sends
 Home.
+
+When a Sesori Bridge is running under its default data directory, Device Canvas
+connects through the owner-only rendezvous file at
+`~/.local/share/sesori/device-canvas/ipc-rendezvous.json`. It publishes the live
+device inventory without persisting claim data. Claimed panes show the owning
+session, remain visible as offline when a device stops, and provide an action to
+open the exact bridge-scoped session in Sesori. Without a compatible Bridge, the
+local canvas continues to work normally.
+
+For a source-run Bridge using `--data-dir`, launch Device Canvas with
+`SESORI_DATA_DIR` set to the same directory.
 
 The implementation relies on private, unsupported Xcode APIs and may require
 updates for every Xcode build.

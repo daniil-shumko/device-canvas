@@ -19,6 +19,7 @@ BUILD_DIR="$ROOT/.build"
 MODULE_DIR="$BUILD_DIR/modules"
 APP="$BUILD_DIR/DeviceCanvas.app"
 CONTENTS="$APP/Contents"
+PROTOCOL_TESTS="$BUILD_DIR/SesoriIntegrationTests"
 
 if [[ ! -d "$XCODE_APP" ]]; then
     print -u2 "Xcode not found: $XCODE_APP"
@@ -43,8 +44,19 @@ DEVELOPER_DIR="$DEVELOPER_DIR" xcrun swiftc \
     -target arm64-apple-macos26.4
 
 DEVELOPER_DIR="$DEVELOPER_DIR" xcrun swiftc \
+    "$ROOT/SesoriIntegration.swift" \
+    "$ROOT/SesoriIntegrationTests.swift" \
+    -parse-as-library \
+    -sdk "$SDK" \
+    -target arm64-apple-macos26.4 \
+    -o "$PROTOCOL_TESTS"
+
+"$PROTOCOL_TESTS"
+
+DEVELOPER_DIR="$DEVELOPER_DIR" xcrun swiftc \
     "$ROOT/DeviceCanvas.swift" \
     "$ROOT/AndroidEmulator.swift" \
+    "$ROOT/SesoriIntegration.swift" \
     -parse-as-library \
     -I "$MODULE_DIR" \
     -F "$FRAMEWORKS" \

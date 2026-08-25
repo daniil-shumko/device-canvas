@@ -7,12 +7,38 @@ private enum DeviceIdentifier: Hashable, Sendable {
     case ios(UUID)
     case android(String)
 
+    init?(stableValue: String) {
+        if stableValue.hasPrefix("ios-"),
+           let identifier = UUID(uuidString: String(stableValue.dropFirst(4))) {
+            self = .ios(identifier)
+            return
+        }
+        if stableValue.hasPrefix("android-") {
+            let serial = String(stableValue.dropFirst(8))
+            guard !serial.isEmpty else {
+                return nil
+            }
+            self = .android(serial)
+            return
+        }
+        return nil
+    }
+
     var stableValue: String {
         switch self {
         case .ios(let identifier):
             "ios-\(identifier.uuidString)"
         case .android(let serial):
             "android-\(serial)"
+        }
+    }
+
+    var platform: CanvasPlatform {
+        switch self {
+        case .ios:
+            .ios
+        case .android:
+            .android
         }
     }
 }
@@ -156,20 +182,38 @@ private final class WorkspaceModel: ObservableObject {
     @Published private(set) var devices: [DeviceInfo]
     @Published private(set) var layouts: [DeviceIdentifier: PaneLayout] = [:]
     @Published private(set) var discoveryError: String?
+    @Published private(set) var onlineDeviceIdentifiers: Set<DeviceIdentifier>
+    @Published private(set) var claimsByDeviceKey: [String: SesoriClaimProjection] = [:]
+    @Published private(set) var sesoriStatus = SesoriIntegrationStatus.disconnected
 
     private var canvasSize = CGSize.zero
     private var highestZIndex = 0.0
     private var nextPlacementIndex = 0
     private var monitoringTask: Task<Void, Never>?
+    private var onlineDevicesByIdentifier: [DeviceIdentifier: DeviceInfo]
+    private lazy var sesoriIntegration = SesoriIntegrationClient(
+        onStatusChanged: { [weak self] status in
+            self?.sesoriStatus = status
+        },
+        onClaimsChanged: { [weak self] claims in
+            self?.claimsByDeviceKey = claims
+            self?.rebuildPresentedDevices()
+        }
+    )
 
     init(initialIdentifiers: [UUID]) {
-        devices = initialIdentifiers.map {
+        let initialDevices = initialIdentifiers.map {
             DeviceInfo(
                 id: .ios($0),
                 name: "Simulator \(String($0.uuidString.prefix(8)))",
                 runtime: "Starting"
             )
         }
+        devices = initialDevices
+        onlineDeviceIdentifiers = Set(initialDevices.map(\.id))
+        onlineDevicesByIdentifier = Dictionary(
+            uniqueKeysWithValues: initialDevices.map { ($0.id, $0) }
+        )
     }
 
     func startMonitoring() {
@@ -177,9 +221,11 @@ private final class WorkspaceModel: ObservableObject {
             return
         }
 
+        sesoriIntegration.start()
+        publishInventory()
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
-                let existingDevices = self?.devices ?? []
+                let existingDevices = self?.onlineDevicesByIdentifier.values.map { $0 } ?? []
                 var discovered: [DeviceInfo] = []
                 var errors: [String] = []
 
@@ -226,6 +272,7 @@ private final class WorkspaceModel: ObservableObject {
     func stopMonitoring() {
         monitoringTask?.cancel()
         monitoringTask = nil
+        sesoriIntegration.stop()
     }
 
     func updateCanvasSize(_ size: CGSize) {
@@ -270,16 +317,100 @@ private final class WorkspaceModel: ObservableObject {
         layouts[identifier] = layout
     }
 
+    func isOnline(_ identifier: DeviceIdentifier) -> Bool {
+        onlineDeviceIdentifiers.contains(identifier)
+    }
+
+    func claim(for identifier: DeviceIdentifier) -> SesoriClaimProjection? {
+        claimsByDeviceKey[identifier.stableValue]
+    }
+
+    func openSesoriSession(_ claim: SesoriClaimProjection) {
+        guard let url = SesoriSessionLinkBuilder.url(for: claim) else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
     private func reconcile(_ discovered: [DeviceInfo], errors: [String]) {
-        var remaining = Dictionary(uniqueKeysWithValues: discovered.map { ($0.id, $0) })
-        var updated = devices.compactMap { remaining.removeValue(forKey: $0.id) }
-        updated.append(contentsOf: remaining.values.sorted {
+        var updatedOnlineDevices: [DeviceIdentifier: DeviceInfo] = [:]
+        for device in discovered {
+            updatedOnlineDevices[device.id] = device
+        }
+        onlineDevicesByIdentifier = updatedOnlineDevices
+        onlineDeviceIdentifiers = Set(updatedOnlineDevices.keys)
+        discoveryError = errors.isEmpty ? nil : errors.joined(separator: "\n")
+        rebuildPresentedDevices()
+        publishInventory()
+    }
+
+    private func rebuildPresentedDevices() {
+        var remainingOnline = onlineDevicesByIdentifier
+        var updated: [DeviceInfo] = []
+        var includedIdentifiers: Set<DeviceIdentifier> = []
+
+        for device in devices {
+            if let online = remainingOnline.removeValue(forKey: device.id) {
+                updated.append(online)
+                includedIdentifiers.insert(device.id)
+            } else if claimsByDeviceKey[device.id.stableValue] != nil {
+                updated.append(device)
+                includedIdentifiers.insert(device.id)
+            }
+        }
+
+        let newOnlineDevices = remainingOnline.values.sorted {
             ($0.name, $0.runtime, $0.id.stableValue) < ($1.name, $1.runtime, $1.id.stableValue)
-        })
+        }
+        updated.append(contentsOf: newOnlineDevices)
+        includedIdentifiers.formUnion(newOnlineDevices.map(\.id))
+
+        for claim in claimsByDeviceKey.values.sorted(by: { $0.deviceKey < $1.deviceKey }) {
+            guard let identifier = DeviceIdentifier(stableValue: claim.deviceKey),
+                  !includedIdentifiers.contains(identifier) else {
+                continue
+            }
+            updated.append(Self.offlinePlaceholder(for: identifier))
+            includedIdentifiers.insert(identifier)
+        }
 
         devices = updated
-        discoveryError = errors.isEmpty ? nil : errors.joined(separator: "\n")
         ensureLayouts()
+    }
+
+    private func publishInventory() {
+        let inventory = onlineDevicesByIdentifier.values
+            .sorted { $0.id.stableValue < $1.id.stableValue }
+            .map { device in
+                CanvasDeviceDescriptor(
+                    deviceKey: device.id.stableValue,
+                    platform: device.id.platform,
+                    displayName: device.name,
+                    runtimeDescription: device.runtime,
+                    modelDescription: device.name,
+                    dimensions: nil,
+                    orientation: nil,
+                    capabilities: .localPresentation
+                )
+            }
+        sesoriIntegration.updateInventory(inventory)
+    }
+
+    private static func offlinePlaceholder(for identifier: DeviceIdentifier) -> DeviceInfo {
+        switch identifier {
+        case .ios(let identifier):
+            DeviceInfo(
+                id: .ios(identifier),
+                name: "iOS Simulator",
+                runtime: "Offline"
+            )
+        case .android(let serial):
+            DeviceInfo(
+                id: .android(serial),
+                name: "Android Emulator",
+                runtime: "Offline"
+            )
+        }
     }
 
     private func ensureLayouts() {
@@ -348,9 +479,15 @@ private struct DeviceWorkspaceView: View {
                         DevicePane(
                             device: device,
                             layout: layout,
+                            isOnline: model.isOnline(device.id),
+                            claim: model.claim(for: device.id),
+                            sesoriStatus: model.sesoriStatus,
                             onActivate: { model.bringToFront(device.id) },
                             onMove: { model.movePane(device.id, to: $0) },
-                            onResize: { model.resizePane(device.id, to: $0) }
+                            onResize: { model.resizePane(device.id, to: $0) },
+                            onOpenSesoriSession: { claim in
+                                model.openSesoriSession(claim)
+                            }
                         )
                         .offset(x: layout.origin.x, y: layout.origin.y)
                         .zIndex(layout.zIndex)
@@ -437,9 +574,13 @@ private struct ScaledDeviceView: View {
 private struct DevicePane: View {
     let device: DeviceInfo
     let layout: PaneLayout
+    let isOnline: Bool
+    let claim: SesoriClaimProjection?
+    let sesoriStatus: SesoriIntegrationStatus
     let onActivate: () -> Void
     let onMove: (CGPoint) -> Void
     let onResize: (CGSize) -> Void
+    let onOpenSesoriSession: (SesoriClaimProjection) -> Void
 
     @GestureState private var moveTranslation = CGSize.zero
     @GestureState private var resizeTranslation = CGSize.zero
@@ -447,6 +588,10 @@ private struct DevicePane: View {
     var body: some View {
         VStack(spacing: 0) {
             titleBar
+                .fixedSize(horizontal: false, vertical: true)
+                .zIndex(1)
+
+            sesoriBar
                 .fixedSize(horizontal: false, vertical: true)
                 .zIndex(1)
 
@@ -482,28 +627,39 @@ private struct DevicePane: View {
 
     @ViewBuilder
     private var deviceScreen: some View {
-        switch device.id {
-        case .ios(let identifier):
-            ScaledDeviceView(
-                deviceIdentifier: identifier,
-                screenAspectRatio: device.screenAspectRatio ?? 0.46
-            )
-        case .android(let serial):
-            AndroidEmulatorView(serial: serial)
+        if isOnline {
+            switch device.id {
+            case .ios(let identifier):
+                ScaledDeviceView(
+                    deviceIdentifier: identifier,
+                    screenAspectRatio: device.screenAspectRatio ?? 0.46
+                )
+            case .android(let serial):
+                AndroidEmulatorView(serial: serial)
+            }
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "powerplug")
+                    .font(.system(size: 34, weight: .light))
+                Text("Device offline")
+                    .font(.callout.weight(.semibold))
+            }
+            .foregroundStyle(.secondary)
+            .accessibilityElement(children: .combine)
         }
     }
 
     private var titleBar: some View {
         HStack(spacing: 10) {
             Circle()
-                .fill(.green)
+                .fill(isOnline ? .green : .secondary)
                 .frame(width: 8, height: 8)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(device.name)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
-                Text("\(device.runtime) - \(device.shortIdentifier)")
+                Text("\(device.runtime) - \(isOnline ? "Online" : "Offline") - \(device.shortIdentifier)")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -521,8 +677,70 @@ private struct DevicePane: View {
         .background(Color.primary.opacity(0.055))
         .gesture(moveGesture)
         .help("Drag to move")
-        .accessibilityLabel("Move \(device.name)")
+        .accessibilityLabel("Move \(device.name), \(isOnline ? "online" : "offline")")
         .accessibilityIdentifier("pane-title-\(device.id.stableValue)")
+    }
+
+    @ViewBuilder
+    private var sesoriBar: some View {
+        HStack(spacing: 8) {
+            switch sesoriStatus {
+            case .connected:
+                if let claim {
+                    Image(systemName: "person.crop.circle.fill")
+                        .foregroundStyle(.indigo)
+                    Text(claim.ownerDisplayTitle)
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                    Spacer(minLength: 6)
+                    Button {
+                        onOpenSesoriSession(claim)
+                    } label: {
+                        Label("Open", systemImage: "arrow.up.forward.app")
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(.indigo.opacity(0.13), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open \(claim.ownerDisplayTitle) in Sesori")
+                    .accessibilityLabel("Open \(claim.ownerDisplayTitle) in Sesori")
+                    .accessibilityIdentifier("open-sesori-\(device.id.stableValue)")
+                } else {
+                    Image(systemName: "circle.dashed")
+                    Text("Unclaimed in Sesori")
+                        .font(.system(size: 11, weight: .medium))
+                    Spacer(minLength: 0)
+                }
+            case .connecting:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Syncing with Sesori")
+                    .font(.system(size: 11, weight: .medium))
+                Spacer(minLength: 0)
+            case .incompatible:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("Sesori update required")
+                    .font(.system(size: 11, weight: .medium))
+                Spacer(minLength: 0)
+            case .disconnected:
+                Image(systemName: "link.badge.plus")
+                    .foregroundStyle(.secondary)
+                Text("Sesori disconnected")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 34)
+        .background(Color.primary.opacity(0.035))
+        .overlay(alignment: .top) {
+            Divider().opacity(0.5)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("sesori-claim-\(device.id.stableValue)")
     }
 
     private var resizeHandle: some View {
