@@ -191,7 +191,11 @@ private final class WorkspaceModel: ObservableObject {
     private var nextPlacementIndex = 0
     private var monitoringTask: Task<Void, Never>?
     private var onlineDevicesByIdentifier: [DeviceIdentifier: DeviceInfo]
+    private let androidWebRTCService = AndroidWebRTCService()
+    private var androidStreamEndpoints: [String: AndroidEmulatorStreamEndpoint] = [:]
+    private var registeredAndroidDeviceKeys: Set<String> = []
     private lazy var sesoriIntegration = SesoriIntegrationClient(
+        remoteStreams: androidWebRTCService,
         onStatusChanged: { [weak self] status in
             self?.sesoriStatus = status
         },
@@ -272,6 +276,10 @@ private final class WorkspaceModel: ObservableObject {
     func stopMonitoring() {
         monitoringTask?.cancel()
         monitoringTask = nil
+        for deviceKey in registeredAndroidDeviceKeys {
+            androidWebRTCService.unregisterEndpoint(for: deviceKey)
+        }
+        registeredAndroidDeviceKeys.removeAll()
         sesoriIntegration.stop()
     }
 
@@ -325,6 +333,13 @@ private final class WorkspaceModel: ObservableObject {
         claimsByDeviceKey[identifier.stableValue]
     }
 
+    func androidStreamEndpoint(for identifier: DeviceIdentifier) -> AndroidEmulatorStreamEndpoint? {
+        guard case .android(let serial) = identifier else {
+            return nil
+        }
+        return androidStreamEndpoints[serial]
+    }
+
     func openSesoriSession(_ claim: SesoriClaimProjection) {
         guard let url = SesoriSessionLinkBuilder.url(for: claim) else {
             return
@@ -337,6 +352,7 @@ private final class WorkspaceModel: ObservableObject {
         for device in discovered {
             updatedOnlineDevices[device.id] = device
         }
+        reconcileAndroidStreamEndpoints(with: updatedOnlineDevices)
         onlineDevicesByIdentifier = updatedOnlineDevices
         onlineDeviceIdentifiers = Set(updatedOnlineDevices.keys)
         discoveryError = errors.isEmpty ? nil : errors.joined(separator: "\n")
@@ -390,10 +406,42 @@ private final class WorkspaceModel: ObservableObject {
                     modelDescription: device.name,
                     dimensions: nil,
                     orientation: nil,
-                    capabilities: .localPresentation
+                    capabilities: device.id.platform == .android
+                        ? androidWebRTCService.capabilities
+                        : .localPresentation
                 )
             }
         sesoriIntegration.updateInventory(inventory)
+    }
+
+    private func reconcileAndroidStreamEndpoints(
+        with onlineDevices: [DeviceIdentifier: DeviceInfo]
+    ) {
+        let onlineAndroidDevices = onlineDevices.keys.compactMap { identifier -> (String, String)? in
+            guard case .android(let serial) = identifier else {
+                return nil
+            }
+            return (serial, identifier.stableValue)
+        }
+        let onlineDeviceKeys = Set(onlineAndroidDevices.map(\.1))
+
+        for (serial, deviceKey) in onlineAndroidDevices {
+            let endpoint: AndroidEmulatorStreamEndpoint
+            if let existing = androidStreamEndpoints[serial] {
+                endpoint = existing
+            } else {
+                endpoint = AndroidEmulatorStreamEndpoint(serial: serial)
+                androidStreamEndpoints[serial] = endpoint
+            }
+            if !registeredAndroidDeviceKeys.contains(deviceKey) {
+                androidWebRTCService.register(endpoint: endpoint, for: deviceKey)
+            }
+        }
+
+        for deviceKey in registeredAndroidDeviceKeys.subtracting(onlineDeviceKeys) {
+            androidWebRTCService.unregisterEndpoint(for: deviceKey)
+        }
+        registeredAndroidDeviceKeys = onlineDeviceKeys
     }
 
     private static func offlinePlaceholder(for identifier: DeviceIdentifier) -> DeviceInfo {
@@ -482,6 +530,7 @@ private struct DeviceWorkspaceView: View {
                             isOnline: model.isOnline(device.id),
                             claim: model.claim(for: device.id),
                             sesoriStatus: model.sesoriStatus,
+                            androidStreamEndpoint: model.androidStreamEndpoint(for: device.id),
                             onActivate: { model.bringToFront(device.id) },
                             onMove: { model.movePane(device.id, to: $0) },
                             onResize: { model.resizePane(device.id, to: $0) },
@@ -577,6 +626,7 @@ private struct DevicePane: View {
     let isOnline: Bool
     let claim: SesoriClaimProjection?
     let sesoriStatus: SesoriIntegrationStatus
+    let androidStreamEndpoint: AndroidEmulatorStreamEndpoint?
     let onActivate: () -> Void
     let onMove: (CGPoint) -> Void
     let onResize: (CGSize) -> Void
@@ -635,7 +685,7 @@ private struct DevicePane: View {
                     screenAspectRatio: device.screenAspectRatio ?? 0.46
                 )
             case .android(let serial):
-                AndroidEmulatorView(serial: serial)
+                AndroidEmulatorView(serial: serial, frameSink: androidStreamEndpoint)
             }
         } else {
             VStack(spacing: 10) {

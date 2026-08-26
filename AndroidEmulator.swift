@@ -236,9 +236,18 @@ enum AndroidEmulatorDiscovery {
 
 struct AndroidEmulatorView: NSViewRepresentable {
     let serial: String
+    let frameSink: (any AndroidEmulatorFrameSink)?
+
+    init(
+        serial: String,
+        frameSink: (any AndroidEmulatorFrameSink)? = nil
+    ) {
+        self.serial = serial
+        self.frameSink = frameSink
+    }
 
     func makeNSView(context: Context) -> AndroidEmulatorScreenView {
-        AndroidEmulatorScreenView(serial: serial)
+        AndroidEmulatorScreenView(serial: serial, frameSink: frameSink)
     }
 
     func updateNSView(_ nsView: AndroidEmulatorScreenView, context: Context) {}
@@ -253,8 +262,12 @@ final class AndroidEmulatorScreenView: NSView {
     private var stream: AndroidEmulatorStream!
     private var videoSize = CGSize.zero
     private var isTouching = false
+    private var isStopped = false
 
-    init(serial: String) {
+    init(
+        serial: String,
+        frameSink: (any AndroidEmulatorFrameSink)? = nil
+    ) {
         super.init(frame: .zero)
 
         displayLayer.backgroundColor = NSColor.black.cgColor
@@ -265,7 +278,8 @@ final class AndroidEmulatorScreenView: NSView {
         stream = AndroidEmulatorStream(
             serial: serial,
             renderer: displayLayer.sampleBufferRenderer,
-            target: self
+            target: self,
+            frameSink: frameSink
         )
         NotificationCenter.default.addObserver(
             self,
@@ -373,7 +387,15 @@ final class AndroidEmulatorScreenView: NSView {
         videoSize = size
     }
 
+    func displayedPixelBuffer() -> CVPixelBuffer? {
+        displayLayer.sampleBufferRenderer.displayedPixelBuffer()
+    }
+
     func stop() {
+        guard !isStopped else {
+            return
+        }
+        isStopped = true
         stream.stop(cancelTouch: isTouching)
         isTouching = false
         displayLayer.sampleBufferRenderer.flush(
@@ -388,7 +410,6 @@ final class AndroidEmulatorScreenView: NSView {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        stream.stop()
     }
 
     private func devicePosition(for event: NSEvent, clamped: Bool) -> ScrcpyPosition? {
@@ -479,10 +500,17 @@ private struct ScrcpyPosition {
     let height: UInt16
 }
 
-private final class AndroidEmulatorStream: @unchecked Sendable {
+private protocol AndroidEmulatorVideoResetRequesting: AnyObject {
+    func requestVideoReset()
+    func stopForSourceReplacement()
+}
+
+private final class AndroidEmulatorStream: AndroidEmulatorVideoResetRequesting, @unchecked Sendable {
     private let serial: String
+    private let sourceIdentity = UUID()
     private let renderer: AVSampleBufferVideoRenderer
     private weak var target: AndroidEmulatorScreenView?
+    private let frameSink: (any AndroidEmulatorFrameSink)?
     private let queue: DispatchQueue
     private let workerQueue: DispatchQueue
     private var parser = H264AnnexBParser()
@@ -494,18 +522,27 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
     private var isWaitingForKeyframe = false
     private var isDrainScheduled = false
     private var generation = 0
+    private var sinkGeneration: Int?
+    private var sourceSequence: UInt64 = 0
+    private var lastSourceTimeNanoseconds: UInt64 = 0
     private var lastVideoSize = CGSize.zero
 
     init(
         serial: String,
         renderer: AVSampleBufferVideoRenderer,
-        target: AndroidEmulatorScreenView
+        target: AndroidEmulatorScreenView,
+        frameSink: (any AndroidEmulatorFrameSink)?
     ) {
         self.serial = serial
         self.renderer = renderer
         self.target = target
+        self.frameSink = frameSink
         queue = DispatchQueue(label: "local.device-canvas.android-stream.\(serial)", qos: .userInitiated)
         workerQueue = DispatchQueue(label: "local.device-canvas.scrcpy-worker.\(serial)", qos: .userInitiated)
+        (frameSink as? AndroidEmulatorStreamEndpoint)?.bindSource(
+            self,
+            sourceIdentity: sourceIdentity
+        )
     }
 
     func start() {
@@ -536,6 +573,17 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
             generation += 1
             closeConnection()
         }
+        (frameSink as? AndroidEmulatorStreamEndpoint)?.unbindSource(
+            sourceIdentity: sourceIdentity
+        )
+    }
+
+    func requestVideoReset() {
+        sendControl(Data([17]))
+    }
+
+    func stopForSourceReplacement() {
+        stop()
     }
 
     func injectTouch(action: UInt8, position: ScrcpyPosition, pressure: Float) {
@@ -600,6 +648,9 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
         }
         generation += 1
         let sessionGeneration = generation
+        sinkGeneration = sessionGeneration
+        sourceSequence = 0
+        lastSourceTimeNanoseconds = 0
         parser = H264AnnexBParser()
         pendingFrames.removeAll()
         isWaitingForKeyframe = false
@@ -658,17 +709,22 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
 
             let serverProcess = Process()
             serverProcess.executableURL = adbURL
+            let serverLogLevel = ProcessInfo.processInfo.environment[
+                "DEVICE_CANVAS_SCRCPY_DEBUG"
+            ] == "1" ? "debug" : "warn"
             serverProcess.arguments = [
                 "-s", serial, "shell",
                 "CLASSPATH=\(remoteServerPath)", "app_process", "/",
                 "com.genymobile.scrcpy.Server", installation.version,
-                "scid=\(scidString)", "log_level=warn", "audio=false",
+                "scid=\(scidString)", "log_level=\(serverLogLevel)", "audio=false",
                 "tunnel_forward=true", "max_size=1600", "video_bit_rate=4000000",
                 "clipboard_autosync=false", "send_device_meta=false",
                 "send_frame_meta=false", "send_stream_meta=false", "send_dummy_byte=true"
             ]
-            serverProcess.standardOutput = FileHandle.nullDevice
-            serverProcess.standardError = FileHandle.nullDevice
+            serverProcess.standardOutput = serverLogLevel == "debug"
+                ? FileHandle.standardError
+                : FileHandle.nullDevice
+            serverProcess.standardError = FileHandle.standardError
             try serverProcess.run()
             process = serverProcess
 
@@ -676,6 +732,7 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
                 port: port,
                 generation: sessionGeneration
             ) else {
+                NSLog("Android emulator video socket unavailable for %@", serial)
                 scheduleReconnect(generation: sessionGeneration)
                 return
             }
@@ -684,6 +741,7 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
                 port: port,
                 generation: sessionGeneration
             ) else {
+                NSLog("Android emulator control socket unavailable for %@", serial)
                 scheduleReconnect(generation: sessionGeneration)
                 return
             }
@@ -713,19 +771,33 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
                 self?.connectionEnded(generation: sessionGeneration)
             }
         } catch {
+            NSLog("Android emulator stream setup failed for %@: %@", serial, error.localizedDescription)
             scheduleReconnect(generation: sessionGeneration)
         }
     }
 
     private func readVideo(socket: Int32, generation sessionGeneration: Int) {
         var bytes = [UInt8](repeating: 0, count: 64 * 1024)
+        var receivedVideoBytes = false
         while true {
             let count = Darwin.recv(socket, &bytes, bytes.count, 0)
             if count < 0, errno == EINTR {
                 continue
             }
             guard count > 0 else {
+                if isCurrent(sessionGeneration) {
+                    NSLog("Android emulator video stream ended for %@", serial)
+                }
                 return
+            }
+            if !receivedVideoBytes,
+               ProcessInfo.processInfo.environment["DEVICE_CANVAS_SCRCPY_DEBUG"] == "1" {
+                receivedVideoBytes = true
+                NSLog(
+                    "Android emulator video socket received its first payload (%d bytes) for %@",
+                    count,
+                    serial
+                )
             }
             let data = Data(bytes[0..<count])
             queue.async { [weak self] in
@@ -896,6 +968,16 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
     }
 
     private func closeConnection() {
+        if let sinkGeneration {
+            frameSink?.sessionDidEnd(
+                AndroidEmulatorStreamContext(
+                    serial: serial,
+                    sourceIdentity: sourceIdentity,
+                    generation: sinkGeneration
+                )
+            )
+            self.sinkGeneration = nil
+        }
         closeSocket(videoSocket)
         closeSocket(controlSocket)
         videoSocket = -1
@@ -906,6 +988,8 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
         pendingFrames.removeAll()
         isWaitingForKeyframe = false
         isDrainScheduled = false
+        sourceSequence = 0
+        lastSourceTimeNanoseconds = 0
         lastVideoSize = .zero
         DispatchQueue.main.async { [weak target] in
             target?.resetInputState()
@@ -937,6 +1021,7 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
 
     private func enqueue(_ frames: [H264Frame]) {
         recoverRendererIfNeeded()
+        forwardToFrameSink(frames)
 
         if let size = frames.last?.size, size != lastVideoSize {
             lastVideoSize = size
@@ -966,6 +1051,34 @@ private final class AndroidEmulatorStream: @unchecked Sendable {
         }
 
         drainPendingFrames()
+    }
+
+    private func forwardToFrameSink(_ frames: [H264Frame]) {
+        guard let frameSink, let sinkGeneration else {
+            return
+        }
+        let context = AndroidEmulatorStreamContext(
+            serial: serial,
+            sourceIdentity: sourceIdentity,
+            generation: sinkGeneration
+        )
+
+        for frame in frames {
+            let now = DispatchTime.now().uptimeNanoseconds
+            let sourceTimeNanoseconds = max(now, lastSourceTimeNanoseconds + 1)
+            lastSourceTimeNanoseconds = sourceTimeNanoseconds
+            frameSink.offer(
+                AndroidEmulatorCompressedFrame(
+                    sampleBuffer: frame.sampleBuffer,
+                    isKeyframe: frame.isKeyframe,
+                    size: frame.size,
+                    sequence: sourceSequence,
+                    sourceTimeNanoseconds: sourceTimeNanoseconds
+                ),
+                context: context
+            )
+            sourceSequence += 1
+        }
     }
 
     private func drainPendingFrames() {
@@ -1003,6 +1116,121 @@ private extension Data {
     mutating func appendBigEndian<T: FixedWidthInteger>(_ value: T) {
         var value = value.bigEndian
         Swift.withUnsafeBytes(of: &value) { append(contentsOf: $0) }
+    }
+}
+
+struct AndroidEmulatorCompressedFrame: @unchecked Sendable {
+    let sampleBuffer: CMSampleBuffer
+    let isKeyframe: Bool
+    let size: CGSize
+    let sequence: UInt64
+    let sourceTimeNanoseconds: UInt64
+}
+
+struct AndroidEmulatorStreamContext: Sendable, Equatable {
+    let serial: String
+    let sourceIdentity: UUID
+    let generation: Int
+}
+
+/// Called synchronously on the scrcpy stream queue. Implementations must hand
+/// frames to bounded storage without blocking the source or local renderer.
+protocol AndroidEmulatorFrameSink: AnyObject, Sendable {
+    func offer(
+        _ frame: AndroidEmulatorCompressedFrame,
+        context: AndroidEmulatorStreamContext
+    )
+    func sessionDidEnd(_ context: AndroidEmulatorStreamContext)
+}
+
+final class AndroidEmulatorStreamEndpoint: AndroidEmulatorFrameSink, @unchecked Sendable {
+    let serial: String
+
+    private let lock = NSLock()
+    private weak var activeSink: (any AndroidEmulatorFrameSink)?
+    private weak var source: (any AndroidEmulatorVideoResetRequesting)?
+    private var sourceIdentity: UUID?
+
+    init(serial: String) {
+        self.serial = serial
+    }
+
+    func attach(_ sink: any AndroidEmulatorFrameSink) -> Bool {
+        guard sink !== self else {
+            return false
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        if let activeSink, activeSink !== sink {
+            return false
+        }
+        activeSink = sink
+        source?.requestVideoReset()
+        return true
+    }
+
+    func detach(_ sink: any AndroidEmulatorFrameSink) {
+        lock.lock()
+        defer { lock.unlock() }
+        if activeSink === sink {
+            activeSink = nil
+        }
+    }
+
+    func requestKeyframe() {
+        lock.lock()
+        defer { lock.unlock() }
+        source?.requestVideoReset()
+    }
+
+    func offer(
+        _ frame: AndroidEmulatorCompressedFrame,
+        context: AndroidEmulatorStreamContext
+    ) {
+        lock.lock()
+        let sink = context.serial == serial && context.sourceIdentity == sourceIdentity
+            ? activeSink
+            : nil
+        lock.unlock()
+        sink?.offer(frame, context: context)
+    }
+
+    func sessionDidEnd(_ context: AndroidEmulatorStreamContext) {
+        lock.lock()
+        let sink = context.serial == serial && context.sourceIdentity == sourceIdentity
+            ? activeSink
+            : nil
+        lock.unlock()
+        sink?.sessionDidEnd(context)
+    }
+
+    fileprivate func bindSource(
+        _ source: any AndroidEmulatorVideoResetRequesting,
+        sourceIdentity: UUID
+    ) {
+        var displacedSource: (any AndroidEmulatorVideoResetRequesting)?
+        lock.lock()
+        if self.sourceIdentity != sourceIdentity {
+            displacedSource = self.source
+        }
+        self.source = source
+        self.sourceIdentity = sourceIdentity
+        let shouldRequestKeyframe = activeSink != nil
+        lock.unlock()
+
+        displacedSource?.stopForSourceReplacement()
+        if shouldRequestKeyframe { source.requestVideoReset() }
+    }
+
+    fileprivate func unbindSource(sourceIdentity: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.sourceIdentity == sourceIdentity else {
+            return
+        }
+        source = nil
+        self.sourceIdentity = nil
     }
 }
 

@@ -10,6 +10,8 @@ private enum SesoriIntegrationTests {
         try await testHandshakeTimeout()
         try testInboundEncoding()
         try testOutboundDecoding()
+        try testStreamCodecAndLimits()
+        try await testRemoteStreamClientLifecycle()
         try testSnapshotReplacementAndRevisionFencing()
         try testDeepLinkEncoding()
         print("Sesori integration protocol tests passed")
@@ -260,6 +262,450 @@ private enum SesoriIntegrationTests {
         }
     }
 
+    private static func testStreamCodecAndLimits() throws {
+        let codec = SesoriProtocolCodec()
+        let offer = rtcDescription(type: .offer, fingerprintByte: "AA", lineEnding: "\r\n")
+        let answer = rtcDescription(type: .answer, fingerprintByte: "BB")
+        let candidate = SesoriICECandidate(
+            candidate: "candidate:1 1 UDP 1 127.0.0.1 5000 typ host",
+            sdpMid: "0",
+            sdpMLineIndex: 0
+        )
+        let turn = SesoriTURNConfiguration(
+            urls: ["turn:turn.example.test:3478?transport=udp"],
+            username: "user",
+            credential: "secret",
+            expiresAt: 123
+        )
+        let requestFrame = streamStartFrame(
+            requestId: "request-a",
+            leaseId: "lease-a",
+            control: false,
+            offer: offer,
+            iceCandidates: [candidate],
+            turn: turn
+        )
+        try expect(
+            try codec.decodeOutbound(requestFrame) == .streamStart(
+                SesoriStreamStartRequest(
+                    requestId: "request-a",
+                    leaseId: "lease-a",
+                    bridgeId: "bridge-a",
+                    sessionId: "session-a",
+                    deviceKey: "android-emulator-5554",
+                    claimRevision: 3,
+                    expiresAt: 4_000_000_000_000,
+                    control: false,
+                    offer: offer,
+                    iceCandidates: [candidate],
+                    turn: turn
+                )
+            ),
+            "stream start should decode all signaling fields"
+        )
+        let noTURNFrame = streamStartFrame(
+            requestId: "request-no-turn",
+            leaseId: "lease-no-turn",
+            control: false,
+            offer: offer,
+            iceCandidates: [],
+            turn: nil
+        )
+        guard case .streamStart(let noTURNRequest) = try codec.decodeOutbound(noTURNFrame) else {
+            throw TestFailure("stream start without TURN should decode")
+        }
+        try expect(noTURNRequest.turn == nil, "omitted TURN should remain absent")
+        try expect(
+            try codec.decodeOutbound(
+                "{\"type\":\"streamRevoke\",\"leaseId\":\"lease-a\",\"reason\":\"claimChanged\"}"
+            ) == .streamRevoke(leaseId: "lease-a", reason: .claimChanged),
+            "stream revoke should decode its lease and reason"
+        )
+
+        let started = try jsonObject(
+            codec.encodeStreamStarted(
+                requestId: "request-a",
+                leaseId: "lease-a",
+                answer: answer,
+                iceCandidates: [candidate]
+            )
+        )
+        try expect(
+            Set(started.keys) == ["type", "requestId", "leaseId", "answer", "iceCandidates"],
+            "stream started should use the exact bridge fields"
+        )
+        try expect(started["type"] as? String == "streamStarted", "stream started type should match")
+        try expect(started["requestId"] as? String == "request-a", "stream started should correlate request")
+        try expect(started["leaseId"] as? String == "lease-a", "stream started should correlate lease")
+
+        let failed = try jsonObject(
+            codec.encodeStreamStartFailed(
+                requestId: "request-a",
+                leaseId: "lease-a",
+                reason: .invalidOffer
+            )
+        )
+        try expect(
+            failed as NSDictionary == [
+                "type": "streamStartFailed",
+                "requestId": "request-a",
+                "leaseId": "lease-a",
+                "reason": "invalidOffer"
+            ] as NSDictionary,
+            "stream failure JSON should exactly match the bridge contract"
+        )
+        let closed = try jsonObject(codec.encodeStreamClosed(leaseId: "lease-a", reason: .failed))
+        try expect(
+            closed as NSDictionary == [
+                "type": "streamClosed",
+                "leaseId": "lease-a",
+                "reason": "failed"
+            ] as NSDictionary,
+            "stream closure JSON should exactly match the bridge contract"
+        )
+
+        try expect(offer.isValid, "CRLF SDP with one matching fingerprint should be valid")
+        let mismatch = SesoriRTCDescription(
+            type: .offer,
+            sdp: offer.sdp,
+            fingerprint: "sha-256 " + Array(repeating: "AB", count: 32).joined(separator: ":")
+        )
+        try expect(!mismatch.isValid, "fingerprint metadata must exactly match SDP")
+        let duplicate = SesoriRTCDescription(
+            type: .offer,
+            sdp: offer.sdp + "a=fingerprint:\(offer.fingerprint)\n",
+            fingerprint: offer.fingerprint
+        )
+        try expect(!duplicate.isValid, "SDP must contain exactly one fingerprint line")
+        let loneCR = SesoriRTCDescription(
+            type: .offer,
+            sdp: offer.sdp.replacingOccurrences(of: "\r\n", with: "\r"),
+            fingerprint: offer.fingerprint
+        )
+        try expect(!loneCR.isValid, "SDP should only accept LF and CRLF line endings")
+        try expectThrows("answer encoder must reject an offer") {
+            _ = try codec.encodeStreamStarted(
+                requestId: "request-a",
+                leaseId: "lease-a",
+                answer: offer,
+                iceCandidates: []
+            )
+        }
+        try expectThrows("more than 64 candidates should fail closed") {
+            _ = try codec.decodeOutbound(
+                streamStartFrame(
+                    requestId: "request-a",
+                    leaseId: "lease-a",
+                    control: false,
+                    offer: offer,
+                    iceCandidates: Array(repeating: candidate, count: 65),
+                    turn: turn
+                )
+            )
+        }
+        try expectThrows("oversized SDP should fail closed") {
+            let oversized = SesoriRTCDescription(
+                type: .offer,
+                sdp: String(repeating: "x", count: 262_145),
+                fingerprint: offer.fingerprint
+            )
+            _ = try codec.decodeOutbound(
+                streamStartFrame(
+                    requestId: "request-a",
+                    leaseId: "lease-a",
+                    control: false,
+                    offer: oversized,
+                    iceCandidates: [],
+                    turn: turn
+                )
+            )
+        }
+        try expectThrows("unknown revoke reason should fail closed") {
+            _ = try codec.decodeOutbound(
+                "{\"type\":\"streamRevoke\",\"leaseId\":\"lease-a\",\"reason\":\"futureReason\"}"
+            )
+        }
+    }
+
+    @MainActor
+    private static func testRemoteStreamClientLifecycle() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("device-canvas-stream-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        guard chmod(directory.path, 0o700) == 0 else {
+            throw TestFailure("failed to set stream test directory permissions")
+        }
+
+        let claimJSON = """
+        {"bridgeId":"bridge-a","sessionId":"session-a",\
+        "deviceKey":"android-emulator-5554","revision":3,"displayTitle":"Stream test"}
+        """
+        let server = try MockSesoriWebSocketServer(
+            bridgeId: "bridge-a",
+            claimsJSON: "[\(claimJSON)]"
+        )
+        let serverPort = try server.start()
+        defer { server.stop() }
+        let file = directory.appendingPathComponent("ipc-rendezvous.json")
+        try JSONEncoder().encode(
+            SesoriRendezvous(
+                protocolVersion: sesoriDeviceCanvasProtocolVersion,
+                port: serverPort,
+                bearerSecret: "stream-secret",
+                bridgeId: "bridge-a",
+                processGeneration: "stream-process"
+            )
+        ).write(to: file, options: .atomic)
+        guard chmod(file.path, 0o600) == 0 else {
+            throw TestFailure("failed to set stream rendezvous permissions")
+        }
+
+        let handler = FakeRemoteStreamHandler()
+        var statuses: [SesoriIntegrationStatus] = []
+        let client = SesoriIntegrationClient(
+            rendezvousURL: file,
+            remoteStreams: handler,
+            onStatusChanged: { statuses.append($0) },
+            onClaimsChanged: { _ in }
+        )
+        client.updateInventory([
+            CanvasDeviceDescriptor(
+                deviceKey: "android-emulator-5554",
+                platform: .android,
+                displayName: "Pixel",
+                runtimeDescription: "Android 16",
+                modelDescription: "Pixel",
+                dimensions: CanvasDimensions(width: 1080, height: 2400),
+                orientation: .portrait,
+                capabilities: .androidRemoteVideo
+            )
+        ])
+        client.start()
+        defer { client.stop() }
+        try await waitUntil("stream client should complete its handshake") {
+            statuses.contains(.connected)
+        }
+        let hello = server.messages(ofType: "hello").first
+        let advertised = hello?["capabilities"] as? [String: Any]
+        try expect(advertised?["remoteVideo"] as? Bool == true, "hello should advertise handler video")
+        try expect(advertised?["remoteControl"] as? Bool == false, "hello should advertise no control")
+
+        let offer = rtcDescription(type: .offer, fingerprintByte: "AA")
+        let answer = rtcDescription(type: .answer, fingerprintByte: "BB")
+        let turn = SesoriTURNConfiguration(
+            urls: ["turn:turn.example.test"],
+            username: "user",
+            credential: "secret",
+            expiresAt: Int64(Date().timeIntervalSince1970 * 1_000) + 60_000
+        )
+
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-control",
+                leaseId: "lease-control",
+                control: true,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("unsupported control should receive a correlated failure") {
+            server.messages(ofType: "streamStartFailed").contains {
+                $0["requestId"] as? String == "request-control"
+                    && $0["leaseId"] as? String == "lease-control"
+                    && $0["reason"] as? String == "unsupported"
+            }
+        }
+        try expect(handler.requests.isEmpty, "unsupported control must not reach the handler")
+
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-invalid",
+                leaseId: "lease-invalid",
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("structurally valid offer should reach the handler") {
+            handler.requests.contains { $0.leaseId == "lease-invalid" }
+        }
+        handler.complete(leaseId: "lease-invalid", with: .failed(.invalidOffer))
+        try await waitUntil("handler offer rejection should retain invalidOffer") {
+            server.messages(ofType: "streamStartFailed").contains {
+                $0["requestId"] as? String == "request-invalid"
+                    && $0["leaseId"] as? String == "lease-invalid"
+                    && $0["reason"] as? String == "invalidOffer"
+            }
+        }
+
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-success",
+                leaseId: "lease-success",
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("supported stream should begin setup without blocking receive") {
+            handler.requests.contains { $0.leaseId == "lease-success" }
+        }
+        handler.complete(
+            leaseId: "lease-success",
+            with: .started(answer: answer, iceCandidates: [])
+        )
+        try await waitUntil("successful setup should preserve request and lease correlation") {
+            server.messages(ofType: "streamStarted").contains {
+                $0["requestId"] as? String == "request-success"
+                    && $0["leaseId"] as? String == "lease-success"
+            }
+        }
+        handler.reportClosed(leaseId: "lease-success", reason: .stopped)
+        try await waitUntil("active handler closure should be reported once") {
+            server.messages(ofType: "streamClosed").filter {
+                $0["leaseId"] as? String == "lease-success"
+            }.count == 1
+        }
+        handler.reportClosed(leaseId: "lease-success", reason: .failed)
+        try await Task.sleep(for: .milliseconds(100))
+        try expect(
+            server.messages(ofType: "streamClosed").filter {
+                $0["leaseId"] as? String == "lease-success"
+            }.count == 1,
+            "stale closure callbacks should be suppressed"
+        )
+
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-pending",
+                leaseId: "lease-pending",
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("pending stream should reach the handler") {
+            handler.requests.contains { $0.leaseId == "lease-pending" }
+        }
+        server.sendToAll(
+            "{\"type\":\"streamRevoke\",\"leaseId\":\"lease-pending\",\"reason\":\"clientDisconnected\"}"
+        )
+        try await waitUntil("revoke while pending should fail setup exactly once") {
+            server.messages(ofType: "streamStartFailed").filter {
+                $0["requestId"] as? String == "request-pending"
+                    && $0["leaseId"] as? String == "lease-pending"
+                    && $0["reason"] as? String == "peerSetupFailed"
+            }.count == 1
+        }
+        try expect(
+            handler.revocations.contains {
+                $0.leaseId == "lease-pending" && $0.reason == .clientDisconnected
+            },
+            "pending revoke should reach the handler"
+        )
+        handler.complete(
+            leaseId: "lease-pending",
+            with: .started(answer: answer, iceCandidates: [])
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        try expect(
+            !server.messages(ofType: "streamStarted").contains {
+                $0["leaseId"] as? String == "lease-pending"
+            },
+            "completion after revoke must not send stale success"
+        )
+
+        let pendingExpiry = Int64(Date().timeIntervalSince1970 * 1_000) + 200
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-expiring-pending",
+                leaseId: "lease-expiring-pending",
+                expiresAt: pendingExpiry,
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("expiring pending stream should reach the handler") {
+            handler.requests.contains { $0.leaseId == "lease-expiring-pending" }
+        }
+        try await waitUntil("pending lease deadline should settle setup") {
+            server.messages(ofType: "streamStartFailed").contains {
+                $0["requestId"] as? String == "request-expiring-pending"
+                    && $0["leaseId"] as? String == "lease-expiring-pending"
+            }
+        }
+        try expect(
+            handler.revocations.contains {
+                $0.leaseId == "lease-expiring-pending" && $0.reason == .expired
+            },
+            "pending lease deadline should revoke the handler"
+        )
+
+        let activeExpiry = Int64(Date().timeIntervalSince1970 * 1_000) + 500
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-expiring-active",
+                leaseId: "lease-expiring-active",
+                expiresAt: activeExpiry,
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("expiring active stream should reach the handler") {
+            handler.requests.contains { $0.leaseId == "lease-expiring-active" }
+        }
+        handler.complete(
+            leaseId: "lease-expiring-active",
+            with: .started(answer: answer, iceCandidates: [])
+        )
+        try await waitUntil("expiring stream should become active before its deadline") {
+            server.messages(ofType: "streamStarted").contains {
+                $0["leaseId"] as? String == "lease-expiring-active"
+            }
+        }
+        try await waitUntil("active lease deadline should revoke the handler") {
+            handler.revocations.contains {
+                $0.leaseId == "lease-expiring-active" && $0.reason == .expired
+            }
+        }
+
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-disconnect",
+                leaseId: "lease-disconnect",
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("disconnect test stream should remain pending") {
+            handler.requests.contains { $0.leaseId == "lease-disconnect" }
+        }
+        client.stop()
+        try expect(handler.closeAllCount == 1, "disconnect should close pending and active streams")
+        handler.complete(
+            leaseId: "lease-disconnect",
+            with: .started(answer: answer, iceCandidates: [])
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        try expect(
+            !server.messages(ofType: "streamStarted").contains {
+                $0["leaseId"] as? String == "lease-disconnect"
+            },
+            "completion after disconnect must be fenced"
+        )
+    }
+
     private static func testSnapshotReplacementAndRevisionFencing() throws {
         var state = SesoriClaimProjectionState()
         try state.begin(bridgeId: "bridge-a")
@@ -348,6 +794,49 @@ private enum SesoriIntegrationTests {
         )
     }
 
+    private static func rtcDescription(
+        type: SesoriRTCDescriptionType,
+        fingerprintByte: String,
+        lineEnding: String = "\n"
+    ) -> SesoriRTCDescription {
+        let fingerprint = "sha-256 "
+            + Array(repeating: fingerprintByte, count: 32).joined(separator: ":")
+        return SesoriRTCDescription(
+            type: type,
+            sdp: "v=0\(lineEnding)a=fingerprint:\(fingerprint)\(lineEnding)",
+            fingerprint: fingerprint
+        )
+    }
+
+    private static func streamStartFrame(
+        requestId: String,
+        leaseId: String,
+        expiresAt: Int64 = 4_000_000_000_000,
+        control: Bool,
+        offer: SesoriRTCDescription,
+        iceCandidates: [SesoriICECandidate],
+        turn: SesoriTURNConfiguration?
+    ) -> String {
+        let request = SesoriStreamStartRequest(
+            requestId: requestId,
+            leaseId: leaseId,
+            bridgeId: "bridge-a",
+            sessionId: "session-a",
+            deviceKey: "android-emulator-5554",
+            claimRevision: 3,
+            expiresAt: expiresAt,
+            control: control,
+            offer: offer,
+            iceCandidates: iceCandidates,
+            turn: turn
+        )
+        let encoded = try! JSONEncoder().encode(request)
+        var object = try! JSONSerialization.jsonObject(with: encoded) as! [String: Any]
+        object["type"] = "streamStart"
+        let frame = try! JSONSerialization.data(withJSONObject: object)
+        return String(data: frame, encoding: .utf8)!
+    }
+
     private static func jsonObject(_ frame: String) throws -> [String: Any] {
         guard let data = frame.data(using: .utf8),
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -383,18 +872,73 @@ private enum SesoriIntegrationTests {
     }
 }
 
+@MainActor
+private final class FakeRemoteStreamHandler: SesoriRemoteStreamHandling {
+    let capabilities = CanvasCapabilities.androidRemoteVideo
+    private(set) var requests: [SesoriStreamStartRequest] = []
+    private(set) var revocations: [(leaseId: String, reason: SesoriStreamRevokeReason)] = []
+    private(set) var closeAllCount = 0
+
+    private var continuations: [
+        String: CheckedContinuation<SesoriRemoteStreamStartResult, Never>
+    ] = [:]
+    private var closedHandler: @MainActor (String, SesoriStreamClosedReason) -> Void = { _, _ in }
+
+    func startStream(_ request: SesoriStreamStartRequest) async -> SesoriRemoteStreamStartResult {
+        requests.append(request)
+        return await withCheckedContinuation { continuation in
+            continuations[request.leaseId] = continuation
+        }
+    }
+
+    func revokeStream(leaseId: String, reason: SesoriStreamRevokeReason) {
+        revocations.append((leaseId, reason))
+        continuations.removeValue(forKey: leaseId)?.resume(returning: .failed(.peerSetupFailed))
+    }
+
+    func closeAllStreams() {
+        closeAllCount += 1
+        let pending = Array(continuations.values)
+        continuations.removeAll()
+        for continuation in pending {
+            continuation.resume(returning: .failed(.peerSetupFailed))
+        }
+    }
+
+    func setStreamClosedHandler(
+        _ handler: @escaping @MainActor (String, SesoriStreamClosedReason) -> Void
+    ) {
+        closedHandler = handler
+    }
+
+    func complete(leaseId: String, with result: SesoriRemoteStreamStartResult) {
+        continuations.removeValue(forKey: leaseId)?.resume(returning: result)
+    }
+
+    func reportClosed(leaseId: String, reason: SesoriStreamClosedReason) {
+        closedHandler(leaseId, reason)
+    }
+}
+
 private final class MockSesoriWebSocketServer {
     private let bridgeId: String
     private let respondsToHello: Bool
+    private let claimsJSON: String
     private let listener: NWListener
     private let queue = DispatchQueue(label: "device-canvas.sesori-integration-tests")
     private let startupSemaphore = DispatchSemaphore(value: 0)
     private var startupError: NWError?
     private var connections: [NWConnection] = []
+    private var receivedMessages: [[String: Any]] = []
 
-    init(bridgeId: String, respondsToHello: Bool = true) throws {
+    init(
+        bridgeId: String,
+        respondsToHello: Bool = true,
+        claimsJSON: String = "[]"
+    ) throws {
         self.bridgeId = bridgeId
         self.respondsToHello = respondsToHello
+        self.claimsJSON = claimsJSON
         let webSocket = NWProtocolWebSocket.Options()
         webSocket.autoReplyPing = true
         let parameters = NWParameters(tls: nil, tcp: NWProtocolTCP.Options())
@@ -439,26 +983,54 @@ private final class MockSesoriWebSocketServer {
         }
     }
 
+    func sendToAll(_ frame: String) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            connections.forEach { self.send(frame, to: $0) }
+        }
+    }
+
+    func messages(ofType type: String) -> [[String: Any]] {
+        queue.sync {
+            receivedMessages.filter { $0["type"] as? String == type }
+        }
+    }
+
     private func accept(_ connection: NWConnection) {
         connections.append(connection)
         connection.start(queue: queue)
+        receiveNextMessage(from: connection)
+    }
+
+    private func receiveNextMessage(from connection: NWConnection) {
         connection.receiveMessage { [weak self] content, _, _, error in
             guard let self,
-                  error == nil,
-                  let content,
-                  let object = try? JSONSerialization.jsonObject(with: content) as? [String: Any],
-                  object["type"] as? String == "hello",
-                  object["protocolVersion"] as? Int == sesoriDeviceCanvasProtocolVersion else {
+                   error == nil,
+                   let content,
+                  let object = try? JSONSerialization.jsonObject(with: content) as? [String: Any] else {
                 connection.cancel()
                 return
             }
-            guard respondsToHello else { return }
-            send(
-                "{\"type\":\"helloAccepted\",\"protocolVersion\":\(sesoriDeviceCanvasProtocolVersion),\"bridgeId\":\"\(bridgeId)\"}",
-                to: connection
-            ) { [weak self] in
-                self?.send("{\"type\":\"claimsSnapshot\",\"claims\":[]}", to: connection)
+            receivedMessages.append(object)
+            if object["type"] as? String == "hello" {
+                guard object["protocolVersion"] as? Int == sesoriDeviceCanvasProtocolVersion else {
+                    connection.cancel()
+                    return
+                }
+                if respondsToHello {
+                    send(
+                        "{\"type\":\"helloAccepted\",\"protocolVersion\":\(sesoriDeviceCanvasProtocolVersion),\"bridgeId\":\"\(bridgeId)\"}",
+                        to: connection
+                    ) { [weak self] in
+                        guard let self else { return }
+                        send(
+                            "{\"type\":\"claimsSnapshot\",\"claims\":\(claimsJSON)}",
+                            to: connection
+                        )
+                    }
+                }
             }
+            receiveNextMessage(from: connection)
         }
     }
 

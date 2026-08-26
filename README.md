@@ -16,6 +16,11 @@ zsh build.sh
 Set `XCODE_APP=/path/to/Xcode.app` if Xcode 27 is installed under a name the
 script cannot discover.
 
+The build downloads the pinned stasel/WebRTC 151.0.0 XCFramework into the
+ignored `.build/dependencies` directory and verifies its SHA-256 digest before
+linking. Set `WEBRTC_XCFRAMEWORK_PATH=/path/to/WebRTC.xcframework` to use an
+already verified local copy.
+
 Android support looks for `adb` under `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or
 Android Studio's default `~/Library/Android/sdk` location. Only running emulator
 serials backed by a local Android Studio AVD are included; physical Android
@@ -52,6 +57,10 @@ device inventory without persisting claim data. Claimed panes show the owning
 session, remain visible as offline when a device stops, and provide an action to
 open the exact bridge-scoped session in Sesori. Without a compatible Bridge, the
 local canvas continues to work normally.
+
+Claimed Android emulators can publish their existing scrcpy video source to a
+Sesori WebRTC client. The current remote path is video-only: remote control and
+iOS remote video remain unadvertised and fail closed.
 
 For a source-run Bridge using `--data-dir`, launch Device Canvas with
 `SESORI_DATA_DIR` set to the same directory.
