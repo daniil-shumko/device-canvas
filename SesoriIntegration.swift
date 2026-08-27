@@ -16,7 +16,9 @@ private enum SesoriProtocolLimits {
     static let maximumSDPMidLength = 128
     static let maximumTURNURLs = 8
     static let maximumTURNURLLength = 2_048
+    static let maximumTURNUsernameByteCount = 509
     static let maximumTURNCredentialLength = 512
+    static let maximumStreamCorrelationsPerConnection = 4_096
     static let maximumRequestIdentifierLength = 128
 }
 
@@ -139,14 +141,232 @@ struct SesoriTURNConfiguration: Codable, Equatable, Sendable {
     let credential: String
     let expiresAt: Int64
 
+    var canonicalURLs: [String]? {
+        guard (1...SesoriProtocolLimits.maximumTURNURLs).contains(urls.count) else {
+            return nil
+        }
+        let canonical = urls.compactMap(Self.normalizedURL)
+        guard canonical.count == urls.count,
+              Set(canonical).count == canonical.count else {
+            return nil
+        }
+        return canonical
+    }
+
     var isValid: Bool {
-        (1...SesoriProtocolLimits.maximumTURNURLs).contains(urls.count)
-            && urls.allSatisfy {
-                $0.hasUTF16Length(in: 1...SesoriProtocolLimits.maximumTURNURLLength)
-            }
-            && username.hasUTF16Length(in: 1...SesoriProtocolLimits.maximumTURNCredentialLength)
+        canonicalURLs != nil
+            && (1...SesoriProtocolLimits.maximumTURNUsernameByteCount).contains(username.utf8.count)
             && credential.hasUTF16Length(in: 1...SesoriProtocolLimits.maximumTURNCredentialLength)
             && expiresAt > 0
+    }
+
+    private static func normalizedURL(_ value: String) -> String? {
+        guard value.hasUTF16Length(in: 1...SesoriProtocolLimits.maximumTURNURLLength),
+              value.rangeOfCharacter(
+                  from: CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+              ) == nil else {
+            return nil
+        }
+
+        guard let schemeEnd = value.firstIndex(of: ":") else {
+            return nil
+        }
+        let scheme = value[..<schemeEnd].lowercased()
+        guard scheme == "turn" || scheme == "turns" else {
+            return nil
+        }
+        let remainder = value[value.index(after: schemeEnd)...]
+
+        let components = remainder.split(
+            separator: "?",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        let defaultTransport = scheme == "turn" ? "udp" : "tcp"
+        let transport: String
+        if components.count == 1 {
+            transport = defaultTransport
+        } else {
+            let query = components[1].lowercased()
+            guard query == "transport=udp" || query == "transport=tcp" else {
+                return nil
+            }
+            transport = String(query.dropFirst("transport=".count))
+        }
+        guard !components[0].isEmpty,
+              let authority = normalizedAuthority(components[0]) else {
+            return nil
+        }
+
+        let port = authority.port ?? (scheme == "turn" ? 3_478 : 5_349)
+        return "\(scheme):\(authority.host):\(port)?transport=\(transport)"
+    }
+
+    private static func normalizedAuthority(
+        _ authority: Substring
+    ) -> (host: String, port: Int?)? {
+        guard !authority.contains("/"),
+              !authority.contains("@"),
+              !authority.contains("#") else {
+            return nil
+        }
+
+        if authority.first == "[" {
+            guard let closingBracket = authority.firstIndex(of: "]"),
+                  closingBracket > authority.startIndex else {
+                return nil
+            }
+            let host = String(authority[authority.index(after: authority.startIndex)..<closingBracket])
+            var address = in6_addr()
+            guard !host.contains("."),
+                  host.withCString({ inet_pton(AF_INET6, $0, &address) }) == 1,
+                  !isIPv4EmbeddedIPv6(address) else {
+                return nil
+            }
+
+            let suffix = authority[authority.index(after: closingBracket)...]
+            let port: Int?
+            if suffix.isEmpty {
+                port = nil
+            } else {
+                guard suffix.first == ":", let parsedPort = normalizedPort(suffix.dropFirst()) else {
+                    return nil
+                }
+                port = parsedPort
+            }
+            return (normalizedIPv6Host(address), port)
+        }
+
+        guard !authority.contains("[") && !authority.contains("]") else {
+            return nil
+        }
+        let hostAndPort = authority.split(
+            separator: ":",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        guard let host = normalizedHost(hostAndPort[0]) else {
+            return nil
+        }
+        if hostAndPort.count == 1 {
+            return (host, nil)
+        }
+        guard let port = normalizedPort(hostAndPort[1]) else {
+            return nil
+        }
+        return (host, port)
+    }
+
+    private static func normalizedHost(_ host: Substring) -> String? {
+        guard !host.isEmpty, host.utf8.count <= 253 else {
+            return nil
+        }
+
+        let hostString = String(host)
+        var ipv4 = in_addr()
+        if hostString.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
+            let canonical = normalizedIPv4Host(ipv4)
+            return hostString == canonical ? canonical : nil
+        }
+        guard !host.utf8.allSatisfy({ (48...57).contains($0) || $0 == 46 }),
+              !isAlternateNumericHost(hostString) else {
+            return nil
+        }
+
+        let dnsHost = host.last == "." ? host.dropLast() : host
+        guard !dnsHost.isEmpty else {
+            return nil
+        }
+        let labels = dnsHost.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.allSatisfy({ label in
+            guard (1...63).contains(label.utf8.count),
+                  let first = label.utf8.first,
+                  let last = label.utf8.last,
+                  isASCIIAlphaNumeric(first),
+                  isASCIIAlphaNumeric(last) else {
+                return false
+            }
+            return label.utf8.allSatisfy { byte in
+                isASCIIAlphaNumeric(byte) || byte == 45
+            }
+        }) else {
+            return nil
+        }
+        return dnsHost.lowercased()
+    }
+
+    private static func isASCIIAlphaNumeric(_ byte: UInt8) -> Bool {
+        (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+    }
+
+    private static func normalizedPort(_ port: Substring) -> Int? {
+        guard !port.isEmpty,
+              port.utf8.allSatisfy({ (48...57).contains($0) }),
+              let value = Int(port),
+              (1...65_535).contains(value) else {
+            return nil
+        }
+        return value
+    }
+
+    private static func normalizedIPv6Host(_ address: in6_addr) -> String {
+        var address = address
+        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        return withUnsafePointer(to: &address) { pointer in
+            buffer.withUnsafeMutableBufferPointer { bufferPointer in
+                _ = inet_ntop(
+                    AF_INET6,
+                    pointer,
+                    bufferPointer.baseAddress,
+                    socklen_t(bufferPointer.count)
+                )
+                return "[\(String(cString: bufferPointer.baseAddress!))]"
+            }
+        }
+    }
+
+    private static func normalizedIPv4Host(_ address: in_addr) -> String {
+        var address = address
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        return withUnsafePointer(to: &address) { pointer in
+            buffer.withUnsafeMutableBufferPointer { bufferPointer in
+                _ = inet_ntop(
+                    AF_INET,
+                    pointer,
+                    bufferPointer.baseAddress,
+                    socklen_t(bufferPointer.count)
+                )
+                return String(cString: bufferPointer.baseAddress!)
+            }
+        }
+    }
+
+    private static func isAlternateNumericHost(_ host: String) -> Bool {
+        var hints = addrinfo()
+        hints.ai_flags = AI_NUMERICHOST
+        hints.ai_family = AF_UNSPEC
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = host.withCString { getaddrinfo($0, nil, &hints, &result) }
+        if let result {
+            freeaddrinfo(result)
+        }
+        return status == 0
+    }
+
+    private static func isIPv4EmbeddedIPv6(_ address: in6_addr) -> Bool {
+        withUnsafeBytes(of: address) { bytes in
+            // These legacy prefixes can spell an IPv4 endpoint as an IPv6 literal.
+            let specialIPv6 = bytes[0..<15].allSatisfy { $0 == 0 }
+                && (bytes[15] == 0 || bytes[15] == 1)
+            let compatible = bytes[0..<12].allSatisfy { $0 == 0 }
+                && !specialIPv6
+            let mapped = bytes[0..<10].allSatisfy { $0 == 0 }
+                && bytes[10] == 0xff && bytes[11] == 0xff
+            let translatable = bytes[0..<8].allSatisfy { $0 == 0 }
+                && bytes[8] == 0xff && bytes[9] == 0xff
+                && bytes[10] == 0 && bytes[11] == 0
+            return compatible || mapped || translatable
+        }
     }
 }
 
@@ -176,6 +396,10 @@ struct SesoriStreamStartRequest: Codable, Equatable, Sendable {
             && iceCandidates.count <= SesoriProtocolLimits.maximumICECandidates
             && iceCandidates.allSatisfy(\.isValid)
             && (turn?.isValid ?? true)
+    }
+
+    var effectiveExpiresAt: Int64 {
+        min(expiresAt, turn?.expiresAt ?? Int64.max)
     }
 }
 
@@ -298,6 +522,7 @@ enum SesoriIPCMessage: Equatable, Sendable {
     case claimRemoved(bridgeId: String, deviceKey: String, revision: Int)
     case compatibilityStatus(supported: Bool, protocolVersion: Int, reason: String)
     case streamStart(SesoriStreamStartRequest)
+    case invalidStreamStart(requestId: String, leaseId: String)
     case streamRevoke(leaseId: String, reason: SesoriStreamRevokeReason)
 }
 
@@ -516,9 +741,18 @@ struct SesoriProtocolCodec: Sendable {
                 reason: message.reason
             )
         case "streamStart":
-            let message = try decoder.decode(StreamStartMessage.self, from: data)
+            guard let message = try? decoder.decode(StreamStartMessage.self, from: data) else {
+                let correlation = try decoder.decode(StreamStartCorrelationMessage.self, from: data)
+                return try invalidStreamStart(
+                    requestId: correlation.requestId,
+                    leaseId: correlation.leaseId
+                )
+            }
             guard message.request.isValid else {
-                throw SesoriIntegrationError.invalidProtocolMessage
+                return try invalidStreamStart(
+                    requestId: message.request.requestId,
+                    leaseId: message.request.leaseId
+                )
             }
             return .streamStart(message.request)
         case "streamRevoke":
@@ -541,6 +775,17 @@ struct SesoriProtocolCodec: Sendable {
             throw SesoriIntegrationError.invalidProtocolMessage
         }
         return frame
+    }
+
+    private func invalidStreamStart(requestId: String, leaseId: String) throws -> SesoriIPCMessage {
+        guard requestId.hasUTF16Length(
+            in: 1...SesoriProtocolLimits.maximumRequestIdentifierLength
+        ), leaseId.hasUTF16Length(
+            in: 1...SesoriProtocolLimits.maximumRequestIdentifierLength
+        ) else {
+            throw SesoriIntegrationError.invalidProtocolMessage
+        }
+        return .invalidStreamStart(requestId: requestId, leaseId: leaseId)
     }
 }
 
@@ -652,6 +897,10 @@ final class SesoriIntegrationClient {
     private let session: URLSession
     private let handshakeTimeout: Duration
     private let remoteStreams: (any SesoriRemoteStreamHandling)?
+    private let socketSender: @MainActor (
+        URLSessionWebSocketTask,
+        URLSessionWebSocketTask.Message
+    ) async throws -> Void
 
     private var status = SesoriIntegrationStatus.disconnected
     private var inventory: [CanvasDeviceDescriptor] = []
@@ -670,19 +919,28 @@ final class SesoriIntegrationClient {
     private var remoteStreamLeaseIdByDeviceKey: [String: String] = [:]
     private var remoteStreamTasksByLeaseId: [String: Task<Void, Never>] = [:]
     private var remoteStreamExpiryTasksByLeaseId: [String: Task<Void, Never>] = [:]
+    private var remoteStreamRequestIds: Set<String> = []
+    private var remoteStreamLeaseIds: Set<String> = []
 
     init(
         rendezvousURL: URL = SesoriRendezvousReader.defaultURL,
         handshakeTimeout: Duration = .seconds(5),
         remoteStreams: (any SesoriRemoteStreamHandling)? = nil,
         onStatusChanged: @escaping (SesoriIntegrationStatus) -> Void,
-        onClaimsChanged: @escaping ([String: SesoriClaimProjection]) -> Void
+        onClaimsChanged: @escaping ([String: SesoriClaimProjection]) -> Void,
+        socketSender: @escaping @MainActor (
+            URLSessionWebSocketTask,
+            URLSessionWebSocketTask.Message
+        ) async throws -> Void = { socket, message in
+            try await socket.send(message)
+        }
     ) {
         rendezvousReader = SesoriRendezvousReader(fileURL: rendezvousURL)
         self.onStatusChanged = onStatusChanged
         self.onClaimsChanged = onClaimsChanged
         self.handshakeTimeout = handshakeTimeout
         self.remoteStreams = remoteStreams
+        self.socketSender = socketSender
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.timeoutIntervalForRequest = 5
@@ -794,7 +1052,8 @@ final class SesoriIntegrationClient {
         generation: Int
     ) async {
         do {
-            try await socket.send(
+            try await socketSender(
+                socket,
                 .string(
                     codec.encodeHello(
                         canvasInstanceId: canvasInstanceId,
@@ -847,7 +1106,7 @@ final class SesoriIntegrationClient {
             }
             helloAccepted = true
             try claimState.begin(bridgeId: bridgeId)
-            try await socket.send(.string(codec.encodeInventory(inventory)))
+            try await socketSender(socket, .string(codec.encodeInventory(inventory)))
             startHeartbeat(socket: socket, generation: generation)
         case .claimsSnapshot(let claims):
             guard helloAccepted, !claimsSnapshotReceived else {
@@ -897,6 +1156,24 @@ final class SesoriIntegrationClient {
                 rendezvous: rendezvous,
                 generation: generation
             )
+        case .invalidStreamStart(let requestId, let leaseId):
+            guard claimsSnapshotReceived else {
+                throw SesoriIntegrationError.unexpectedProtocolMessage
+            }
+            guard reserveRemoteStreamCorrelation(
+                requestId: requestId,
+                leaseId: leaseId
+            ) else {
+                tearDownConnection(clearActiveRendezvous: true, nextStatus: .disconnected)
+                return
+            }
+            await sendStreamStartFailed(
+                requestId: requestId,
+                leaseId: leaseId,
+                reason: .peerSetupFailed,
+                socket: socket,
+                generation: generation
+            )
         case .streamRevoke(let leaseId, let reason):
             await handleStreamRevoke(
                 leaseId: leaseId,
@@ -913,10 +1190,18 @@ final class SesoriIntegrationClient {
         rendezvous: SesoriRendezvous,
         generation: Int
     ) async throws {
+        guard reserveRemoteStreamCorrelation(
+            requestId: request.requestId,
+            leaseId: request.leaseId
+        ) else {
+            tearDownConnection(clearActiveRendezvous: true, nextStatus: .disconnected)
+            return
+        }
+
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
-        guard request.expiresAt > now,
-              (request.turn?.expiresAt ?? Int64.max) > now else {
-            try await socket.send(
+        guard request.effectiveExpiresAt > now else {
+            try await socketSender(
+                socket,
                 .string(
                     codec.encodeStreamStartFailed(
                         requestId: request.requestId,
@@ -945,7 +1230,8 @@ final class SesoriIntegrationClient {
                       && remoteStreams.capabilities.remoteControl
                       && remoteStreams.capabilities.input
               ) else {
-            try await socket.send(
+            try await socketSender(
+                socket,
                 .string(
                     codec.encodeStreamStartFailed(
                         requestId: request.requestId,
@@ -959,7 +1245,24 @@ final class SesoriIntegrationClient {
 
         guard remoteStreamEntriesByLeaseId[request.leaseId] == nil,
               remoteStreamLeaseIdByDeviceKey[request.deviceKey] == nil else {
-            try await socket.send(
+            try await socketSender(
+                socket,
+                .string(
+                    codec.encodeStreamStartFailed(
+                        requestId: request.requestId,
+                        leaseId: request.leaseId,
+                        reason: .peerSetupFailed
+                    )
+                )
+            )
+            return
+        }
+
+        let expiresAt = request.effectiveExpiresAt
+        let schedulingNow = Int64(Date().timeIntervalSince1970 * 1_000)
+        guard expiresAt > schedulingNow else {
+            try await socketSender(
+                socket,
                 .string(
                     codec.encodeStreamStartFailed(
                         requestId: request.requestId,
@@ -984,24 +1287,28 @@ final class SesoriIntegrationClient {
             phase: .pending
         )
         remoteStreamLeaseIdByDeviceKey[request.deviceKey] = request.leaseId
-        let expiryDelay = request.expiresAt - now
-        remoteStreamExpiryTasksByLeaseId[request.leaseId] = Task { [weak self] in
+        let clock = ContinuousClock()
+        let monotonicDeadline = clock.now.advanced(
+            by: .milliseconds(expiresAt - schedulingNow)
+        )
+        remoteStreamExpiryTasksByLeaseId[request.leaseId] = Task.detached { [weak self] in
             do {
-                try await Task.sleep(for: .milliseconds(expiryDelay))
+                // The monotonic bound resists scheduler delay; wall checks catch clock jumps.
+                while clock.now < monotonicDeadline {
+                    let wallRemaining = expiresAt
+                        - Int64(Date().timeIntervalSince1970 * 1_000)
+                    guard wallRemaining > 0 else { break }
+                    let nextWallCheck = clock.now.advanced(
+                        by: .milliseconds(min(wallRemaining, 250))
+                    )
+                    try await clock.sleep(until: min(monotonicDeadline, nextWallCheck))
+                }
             } catch {
                 return
             }
-            guard let self,
-                  let entry = self.remoteStreamEntriesByLeaseId[request.leaseId],
-                  entry.token == token,
-                  entry.socket === socket,
-                  entry.generation == generation else {
-                return
-            }
-            await self.handleStreamRevoke(
+            await self?.expireRemoteStream(
                 leaseId: request.leaseId,
-                reason: .expired,
-                socket: socket,
+                token: token,
                 generation: generation
             )
         }
@@ -1037,11 +1344,9 @@ final class SesoriIntegrationClient {
               entry.phase == .pending else {
             return
         }
-        remoteStreamTasksByLeaseId[request.leaseId] = nil
-
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
-        guard request.expiresAt > now,
-              (request.turn?.expiresAt ?? Int64.max) > now else {
+        guard request.effectiveExpiresAt > now else {
+            remoteStreamTasksByLeaseId[request.leaseId] = nil
             removeRemoteStreamEntry(entry)
             remoteStreams?.revokeStream(leaseId: request.leaseId, reason: .expired)
             await sendStreamStartFailed(
@@ -1056,6 +1361,7 @@ final class SesoriIntegrationClient {
 
         switch result {
         case .failed(let reason):
+            remoteStreamTasksByLeaseId[request.leaseId] = nil
             removeRemoteStreamEntry(entry)
             await sendStreamStartFailed(
                 requestId: request.requestId,
@@ -1069,6 +1375,7 @@ final class SesoriIntegrationClient {
                   answer.isValid,
                   iceCandidates.count <= SesoriProtocolLimits.maximumICECandidates,
                   iceCandidates.allSatisfy(\.isValid) else {
+                remoteStreamTasksByLeaseId[request.leaseId] = nil
                 removeRemoteStreamEntry(entry)
                 remoteStreams?.revokeStream(leaseId: request.leaseId, reason: .startFailed)
                 await sendStreamStartFailed(
@@ -1080,18 +1387,55 @@ final class SesoriIntegrationClient {
                 )
                 return
             }
-            var activeEntry = entry
-            activeEntry.phase = .active
-            remoteStreamEntriesByLeaseId[request.leaseId] = activeEntry
-            await sendStreamStarted(
+            var sendingEntry = entry
+            sendingEntry.phase = .sending
+            remoteStreamEntriesByLeaseId[request.leaseId] = sendingEntry
+            guard await sendStreamStarted(
                 requestId: request.requestId,
                 leaseId: request.leaseId,
                 answer: answer,
                 iceCandidates: iceCandidates,
                 socket: socket,
                 generation: generation
-            )
+            ) else {
+                return
+            }
+
+            guard generation == connectionGeneration,
+                  socket === webSocketTask,
+                  let currentEntry = remoteStreamEntriesByLeaseId[request.leaseId],
+                  currentEntry.token == token,
+                  currentEntry.phase == .sending else {
+                return
+            }
+            guard request.effectiveExpiresAt
+                > Int64(Date().timeIntervalSince1970 * 1_000) else {
+                removeRemoteStreamEntry(currentEntry)
+                remoteStreams?.revokeStream(leaseId: request.leaseId, reason: .expired)
+                tearDownConnection(clearActiveRendezvous: true, nextStatus: .disconnected)
+                return
+            }
+            var activeEntry = currentEntry
+            activeEntry.phase = .active
+            remoteStreamEntriesByLeaseId[request.leaseId] = activeEntry
+            remoteStreamTasksByLeaseId[request.leaseId] = nil
         }
+    }
+
+    private func expireRemoteStream(leaseId: String, token: UUID, generation: Int) async {
+        guard generation == connectionGeneration,
+              let socket = webSocketTask,
+              let entry = remoteStreamEntriesByLeaseId[leaseId],
+              entry.token == token,
+              entry.socket === socket else {
+            return
+        }
+        await handleStreamRevoke(
+            leaseId: leaseId,
+            reason: .expired,
+            socket: socket,
+            generation: generation
+        )
     }
 
     private func handleStreamRevoke(
@@ -1106,12 +1450,14 @@ final class SesoriIntegrationClient {
             return
         }
 
-        let wasPending = entry.phase == .pending
+        let phase = entry.phase
         removeRemoteStreamEntry(entry)
         remoteStreamTasksByLeaseId[leaseId]?.cancel()
         remoteStreamTasksByLeaseId[leaseId] = nil
         remoteStreams?.revokeStream(leaseId: leaseId, reason: reason)
-        if wasPending {
+        if phase == .sending {
+            tearDownConnection(clearActiveRendezvous: true, nextStatus: .disconnected)
+        } else if phase == .pending {
             await sendStreamStartFailed(
                 requestId: entry.requestId,
                 leaseId: leaseId,
@@ -1144,6 +1490,18 @@ final class SesoriIntegrationClient {
         )
     }
 
+    private func reserveRemoteStreamCorrelation(requestId: String, leaseId: String) -> Bool {
+        guard remoteStreamRequestIds.count
+                < SesoriProtocolLimits.maximumStreamCorrelationsPerConnection,
+              !remoteStreamRequestIds.contains(requestId),
+              !remoteStreamLeaseIds.contains(leaseId) else {
+            return false
+        }
+        remoteStreamRequestIds.insert(requestId)
+        remoteStreamLeaseIds.insert(leaseId)
+        return true
+    }
+
     private func remoteStreamClosed(
         leaseId: String,
         reason: SesoriStreamClosedReason,
@@ -1153,10 +1511,15 @@ final class SesoriIntegrationClient {
         guard generation == connectionGeneration,
               socket === webSocketTask,
               let entry = remoteStreamEntriesByLeaseId[leaseId],
-              entry.phase == .active,
               entry.socket === socket else {
             return
         }
+        if entry.phase == .sending {
+            removeRemoteStreamEntry(entry)
+            tearDownConnection(clearActiveRendezvous: true, nextStatus: .disconnected)
+            return
+        }
+        guard entry.phase == .active else { return }
         removeRemoteStreamEntry(entry)
         Task { [weak self] in
             await self?.sendStreamClosed(
@@ -1175,9 +1538,10 @@ final class SesoriIntegrationClient {
         iceCandidates: [SesoriICECandidate],
         socket: URLSessionWebSocketTask,
         generation: Int
-    ) async {
+    ) async -> Bool {
         do {
-            try await socket.send(
+            try await socketSender(
+                socket,
                 .string(
                     codec.encodeStreamStarted(
                         requestId: requestId,
@@ -1187,8 +1551,10 @@ final class SesoriIntegrationClient {
                     )
                 )
             )
+            return true
         } catch {
             handleStreamSendFailure(socket: socket, generation: generation)
+            return false
         }
     }
 
@@ -1200,7 +1566,8 @@ final class SesoriIntegrationClient {
         generation: Int
     ) async {
         do {
-            try await socket.send(
+            try await socketSender(
+                socket,
                 .string(
                     codec.encodeStreamStartFailed(
                         requestId: requestId,
@@ -1221,7 +1588,8 @@ final class SesoriIntegrationClient {
         generation: Int
     ) async {
         do {
-            try await socket.send(
+            try await socketSender(
+                socket,
                 .string(codec.encodeStreamClosed(leaseId: leaseId, reason: reason))
             )
         } catch {
@@ -1258,7 +1626,8 @@ final class SesoriIntegrationClient {
                         return
                     }
                     let observedAt = Int64(Date().timeIntervalSince1970 * 1_000)
-                    try await socket.send(
+                    try await socketSender(
+                        socket,
                         .string(
                             codec.encodeHeartbeat(
                                 canvasInstanceId: canvasInstanceId,
@@ -1305,7 +1674,7 @@ final class SesoriIntegrationClient {
             return
         }
         do {
-            try await socket.send(.string(codec.encodeInventory(inventory)))
+            try await socketSender(socket, .string(codec.encodeInventory(inventory)))
         } catch {
             guard generation == connectionGeneration else {
                 return
@@ -1326,6 +1695,8 @@ final class SesoriIntegrationClient {
         remoteStreamExpiryTasksByLeaseId.removeAll()
         remoteStreamEntriesByLeaseId.removeAll()
         remoteStreamLeaseIdByDeviceKey.removeAll()
+        remoteStreamRequestIds.removeAll()
+        remoteStreamLeaseIds.removeAll()
         remoteStreams?.setStreamClosedHandler { _, _ in }
         if hadRemoteStreams {
             remoteStreams?.closeAllStreams()
@@ -1362,6 +1733,7 @@ final class SesoriIntegrationClient {
 
     private enum RemoteStreamPhase: Equatable {
         case pending
+        case sending
         case active
     }
 
@@ -1474,6 +1846,11 @@ private struct StreamStartMessage: Decodable {
             turn: turn
         )
     }
+}
+
+private struct StreamStartCorrelationMessage: Decodable {
+    let requestId: String
+    let leaseId: String
 }
 
 private struct StreamRevokeMessage: Decodable {

@@ -277,6 +277,84 @@ private enum SesoriIntegrationTests {
             credential: "secret",
             expiresAt: 123
         )
+        try expect(turn.isValid, "a canonical TURN URL should be valid")
+        try expect(
+            SesoriTURNConfiguration(
+                urls: [
+                    "turn:192.0.2.1:3478?transport=udp",
+                    "turns:turn.example.test:5349?transport=tcp",
+                    "turn:[2001:db8::1]:3478",
+                    "turn:[::]",
+                    "turn:[::1]",
+                    "TURN:TURN2.EXAMPLE.TEST.:3478?TRANSPORT=UDP",
+                    "turns:secure-udp.example.test?transport=udp"
+                ],
+                username: "user",
+                credential: "secret",
+                expiresAt: 123
+            ).isValid,
+            "TURN should accept bounded IP, DNS, UDP, TCP, and TLS URLs"
+        )
+        for invalidURL in [
+            "https://turn.example.test",
+            "turn:user@turn.example.test",
+            "turn:turn.example.test/path",
+            "turn:turn.example.test:0",
+            "turn:turn.example.test:65536",
+            "turn:999.999.999.999",
+            "turn:127.000.000.001",
+            "turn:0x7f000001",
+            "turn:0x7f.0.0.1",
+            "turn:[::ffff:127.0.0.1]",
+            "turn:[::ffff:127.000.000.001]",
+            "turn:[::ffff:7f00:1]",
+            "turn:[::7f00:1]",
+            "turn:[::ffff:0:7f00:1]",
+            "turn:[2001:db8::192.168.001.001]",
+            "turn:turn.example.test?transport=sctp",
+            "turn:turn.example.test?transport=udp&debug=true",
+            "turn:turn example.test"
+        ] {
+            try expect(
+                !SesoriTURNConfiguration(
+                    urls: [invalidURL],
+                    username: "user",
+                    credential: "secret",
+                    expiresAt: 123
+                ).isValid,
+                "malformed TURN URL should fail closed: \(invalidURL)"
+            )
+        }
+        try expect(
+            SesoriTURNConfiguration(
+                urls: ["turn:turn.example.test"],
+                username: String(repeating: "u", count: 509),
+                credential: "secret",
+                expiresAt: 123
+            ).isValid,
+            "TURN usernames at WebRTC's byte limit should remain valid"
+        )
+        try expect(
+            !SesoriTURNConfiguration(
+                urls: [
+                    "turn:turn.example.test",
+                    "TURN:TURN.EXAMPLE.TEST.:03478?TRANSPORT=UDP"
+                ],
+                username: "user",
+                credential: "secret",
+                expiresAt: 123
+            ).isValid,
+            "semantically duplicate TURN URLs should fail closed"
+        )
+        try expect(
+            !SesoriTURNConfiguration(
+                urls: ["turn:turn.example.test"],
+                username: String(repeating: "u", count: 510),
+                credential: "secret",
+                expiresAt: 123
+            ).isValid,
+            "TURN usernames beyond WebRTC's byte limit should fail closed"
+        )
         let requestFrame = streamStartFrame(
             requestId: "request-a",
             leaseId: "lease-a",
@@ -303,6 +381,10 @@ private enum SesoriIntegrationTests {
             ),
             "stream start should decode all signaling fields"
         )
+        try expect(
+            turn.canonicalURLs == ["turn:turn.example.test:3478?transport=udp"],
+            "validated TURN URLs should expose their libwebrtc-compatible form"
+        )
         let noTURNFrame = streamStartFrame(
             requestId: "request-no-turn",
             leaseId: "lease-no-turn",
@@ -315,6 +397,19 @@ private enum SesoriIntegrationTests {
             throw TestFailure("stream start without TURN should decode")
         }
         try expect(noTURNRequest.turn == nil, "omitted TURN should remain absent")
+        try expect(
+            try codec.decodeOutbound(
+                malformedTurnFrame(
+                    requestId: "request-malformed-shape",
+                    leaseId: "lease-malformed-shape",
+                    offer: offer
+                )
+            ) == .invalidStreamStart(
+                requestId: "request-malformed-shape",
+                leaseId: "lease-malformed-shape"
+            ),
+            "decodable correlation should isolate a malformed TURN object"
+        )
         try expect(
             try codec.decodeOutbound(
                 "{\"type\":\"streamRevoke\",\"leaseId\":\"lease-a\",\"reason\":\"claimChanged\"}"
@@ -391,8 +486,8 @@ private enum SesoriIntegrationTests {
                 iceCandidates: []
             )
         }
-        try expectThrows("more than 64 candidates should fail closed") {
-            _ = try codec.decodeOutbound(
+        try expect(
+            try codec.decodeOutbound(
                 streamStartFrame(
                     requestId: "request-a",
                     leaseId: "lease-a",
@@ -401,15 +496,16 @@ private enum SesoriIntegrationTests {
                     iceCandidates: Array(repeating: candidate, count: 65),
                     turn: turn
                 )
-            )
-        }
-        try expectThrows("oversized SDP should fail closed") {
-            let oversized = SesoriRTCDescription(
-                type: .offer,
-                sdp: String(repeating: "x", count: 262_145),
-                fingerprint: offer.fingerprint
-            )
-            _ = try codec.decodeOutbound(
+            ) == .invalidStreamStart(requestId: "request-a", leaseId: "lease-a"),
+            "too many candidates should reject only their correlated stream"
+        )
+        let oversized = SesoriRTCDescription(
+            type: .offer,
+            sdp: String(repeating: "x", count: 262_145),
+            fingerprint: offer.fingerprint
+        )
+        try expect(
+            try codec.decodeOutbound(
                 streamStartFrame(
                     requestId: "request-a",
                     leaseId: "lease-a",
@@ -418,8 +514,9 @@ private enum SesoriIntegrationTests {
                     iceCandidates: [],
                     turn: turn
                 )
-            )
-        }
+            ) == .invalidStreamStart(requestId: "request-a", leaseId: "lease-a"),
+            "oversized SDP should reject only its correlated stream"
+        )
         try expectThrows("unknown revoke reason should fail closed") {
             _ = try codec.decodeOutbound(
                 "{\"type\":\"streamRevoke\",\"leaseId\":\"lease-a\",\"reason\":\"futureReason\"}"
@@ -462,12 +559,17 @@ private enum SesoriIntegrationTests {
         }
 
         let handler = FakeRemoteStreamHandler()
+        let sendGate = StreamStartedSendGate()
+        defer { sendGate.releaseWithFailure() }
         var statuses: [SesoriIntegrationStatus] = []
         let client = SesoriIntegrationClient(
             rendezvousURL: file,
             remoteStreams: handler,
             onStatusChanged: { statuses.append($0) },
-            onClaimsChanged: { _ in }
+            onClaimsChanged: { _ in },
+            socketSender: { socket, message in
+                try await sendGate.send(socket: socket, message: message)
+            }
         )
         client.updateInventory([
             CanvasDeviceDescriptor(
@@ -501,6 +603,62 @@ private enum SesoriIntegrationTests {
         )
 
         server.sendToAll(
+            malformedTurnFrame(
+                requestId: "request-malformed-turn",
+                leaseId: "lease-malformed-turn",
+                offer: offer
+            )
+        )
+        try await waitUntil("malformed TURN should fail only its correlated stream") {
+            server.messages(ofType: "streamStartFailed").contains {
+                $0["requestId"] as? String == "request-malformed-turn"
+                    && $0["leaseId"] as? String == "lease-malformed-turn"
+                    && $0["reason"] as? String == "peerSetupFailed"
+            }
+        }
+        try expect(handler.requests.isEmpty, "malformed TURN must not reach the stream handler")
+        try expect(statuses.last == .connected, "malformed TURN must not disconnect the protocol")
+
+        let connectedCountBeforeCollision = statuses.filter { $0 == .connected }.count
+        let disconnectedCountBeforeCollision = statuses.filter { $0 == .disconnected }.count
+        let closeAllCountBeforeCollision = handler.closeAllCount
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-collision",
+                leaseId: "lease-collision",
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("collision stream should remain pending") {
+            handler.requests.contains { $0.leaseId == "lease-collision" }
+        }
+        server.sendToAll(
+            malformedTurnFrame(
+                requestId: "request-collision",
+                leaseId: "lease-collision",
+                offer: offer
+            )
+        )
+        try await waitUntil("duplicate correlation should fence the protocol connection") {
+            statuses.filter { $0 == .disconnected }.count > disconnectedCountBeforeCollision
+                && handler.closeAllCount == closeAllCountBeforeCollision + 1
+        }
+        try expect(
+            !server.messages(ofType: "streamStartFailed").contains {
+                $0["leaseId"] as? String == "lease-collision"
+            } && !server.messages(ofType: "streamStarted").contains {
+                $0["leaseId"] as? String == "lease-collision"
+            },
+            "ambiguous duplicate correlation must not emit contradictory terminal messages"
+        )
+        try await waitUntil("the client should reconnect after a correlation violation") {
+            statuses.filter { $0 == .connected }.count > connectedCountBeforeCollision
+        }
+
+        server.sendToAll(
             streamStartFrame(
                 requestId: "request-control",
                 leaseId: "lease-control",
@@ -517,7 +675,10 @@ private enum SesoriIntegrationTests {
                     && $0["reason"] as? String == "unsupported"
             }
         }
-        try expect(handler.requests.isEmpty, "unsupported control must not reach the handler")
+        try expect(
+            !handler.requests.contains { $0.leaseId == "lease-control" },
+            "unsupported control must not reach the handler"
+        )
 
         server.sendToAll(
             streamStartFrame(
@@ -539,6 +700,33 @@ private enum SesoriIntegrationTests {
                     && $0["leaseId"] as? String == "lease-invalid"
                     && $0["reason"] as? String == "invalidOffer"
             }
+        }
+
+        let connectedCountAfterFailure = statuses.filter { $0 == .connected }.count
+        let disconnectedCountAfterFailure = statuses.filter { $0 == .disconnected }.count
+        let failedCorrelationRequestCount = handler.requests.filter {
+            $0.leaseId == "lease-invalid"
+        }.count
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-invalid",
+                leaseId: "lease-invalid",
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("completed failure correlation should remain reserved") {
+            statuses.filter { $0 == .disconnected }.count > disconnectedCountAfterFailure
+        }
+        try expect(
+            handler.requests.filter { $0.leaseId == "lease-invalid" }.count
+                == failedCorrelationRequestCount,
+            "a completed failure correlation must not start replacement media"
+        )
+        try await waitUntil("the client should reconnect after terminal correlation reuse") {
+            statuses.filter { $0 == .connected }.count > connectedCountAfterFailure
         }
 
         server.sendToAll(
@@ -578,6 +766,33 @@ private enum SesoriIntegrationTests {
             }.count == 1,
             "stale closure callbacks should be suppressed"
         )
+
+        let connectedCountAfterClosure = statuses.filter { $0 == .connected }.count
+        let disconnectedCountAfterClosure = statuses.filter { $0 == .disconnected }.count
+        let closedCorrelationRequestCount = handler.requests.filter {
+            $0.leaseId == "lease-success"
+        }.count
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-success",
+                leaseId: "lease-success",
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("completed closure correlation should remain reserved") {
+            statuses.filter { $0 == .disconnected }.count > disconnectedCountAfterClosure
+        }
+        try expect(
+            handler.requests.filter { $0.leaseId == "lease-success" }.count
+                == closedCorrelationRequestCount,
+            "a completed closure correlation must not start replacement media"
+        )
+        try await waitUntil("the client should reconnect after closed correlation reuse") {
+            statuses.filter { $0 == .connected }.count > connectedCountAfterClosure
+        }
 
         server.sendToAll(
             streamStartFrame(
@@ -620,7 +835,7 @@ private enum SesoriIntegrationTests {
             "completion after revoke must not send stale success"
         )
 
-        let pendingExpiry = Int64(Date().timeIntervalSince1970 * 1_000) + 200
+        let pendingExpiry = Int64(Date().timeIntervalSince1970 * 1_000) + 1_000
         server.sendToAll(
             streamStartFrame(
                 requestId: "request-expiring-pending",
@@ -648,7 +863,7 @@ private enum SesoriIntegrationTests {
             "pending lease deadline should revoke the handler"
         )
 
-        let activeExpiry = Int64(Date().timeIntervalSince1970 * 1_000) + 500
+        let activeExpiry = Int64(Date().timeIntervalSince1970 * 1_000) + 1_200
         server.sendToAll(
             streamStartFrame(
                 requestId: "request-expiring-active",
@@ -678,6 +893,90 @@ private enum SesoriIntegrationTests {
             }
         }
 
+        let turnExpiry = Int64(Date().timeIntervalSince1970 * 1_000) + 1_500
+        let expiringTurn = SesoriTURNConfiguration(
+            urls: ["turns:turn.example.test:5349?transport=tcp"],
+            username: "user",
+            credential: "secret",
+            expiresAt: turnExpiry
+        )
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-expiring-turn",
+                leaseId: "lease-expiring-turn",
+                expiresAt: turnExpiry + 10_000,
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: expiringTurn
+            )
+        )
+        try await waitUntil("credential-expiring stream should reach the handler") {
+            handler.requests.contains { $0.leaseId == "lease-expiring-turn" }
+        }
+        handler.complete(
+            leaseId: "lease-expiring-turn",
+            with: .started(answer: answer, iceCandidates: [])
+        )
+        try await waitUntil("credential-expiring stream should become active") {
+            server.messages(ofType: "streamStarted").contains {
+                $0["leaseId"] as? String == "lease-expiring-turn"
+            }
+        }
+        try await waitUntil("TURN credential deadline should revoke the handler") {
+            handler.revocations.contains {
+                $0.leaseId == "lease-expiring-turn" && $0.reason == .expired
+            }
+        }
+
+        let connectedCountBeforeSendingExpiry = statuses.filter { $0 == .connected }.count
+        let disconnectedCountBeforeSendingExpiry = statuses.filter { $0 == .disconnected }.count
+        let sendingExpiry = Int64(Date().timeIntervalSince1970 * 1_000) + 1_200
+        sendGate.blockStreamStarted(leaseId: "lease-expiring-send")
+        server.sendToAll(
+            streamStartFrame(
+                requestId: "request-expiring-send",
+                leaseId: "lease-expiring-send",
+                expiresAt: sendingExpiry,
+                control: false,
+                offer: offer,
+                iceCandidates: [],
+                turn: turn
+            )
+        )
+        try await waitUntil("send-race stream should reach the handler") {
+            handler.requests.contains { $0.leaseId == "lease-expiring-send" }
+        }
+        handler.complete(
+            leaseId: "lease-expiring-send",
+            with: .started(answer: answer, iceCandidates: [])
+        )
+        try await waitUntil("streamStarted send should enter the deterministic gate") {
+            sendGate.enteredLeaseIds.contains("lease-expiring-send")
+        }
+        try await waitUntil("credential expiry should revoke an in-flight success send") {
+            handler.revocations.contains {
+                $0.leaseId == "lease-expiring-send" && $0.reason == .expired
+            }
+        }
+        try await waitUntil("in-flight expiry should terminate the ambiguous protocol connection") {
+            statuses.filter { $0 == .disconnected }.count > disconnectedCountBeforeSendingExpiry
+        }
+        try await waitUntil("expiry should cancel the in-flight success task") {
+            sendGate.cancelledLeaseIds.contains("lease-expiring-send")
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        try expect(
+            !server.messages(ofType: "streamStarted").contains {
+                $0["leaseId"] as? String == "lease-expiring-send"
+            },
+            "expiry during an in-flight send must not deliver stale streamStarted"
+        )
+        try await waitUntil("the client should reconnect after fencing the ambiguous send") {
+            statuses.filter { $0 == .connected }.count > connectedCountBeforeSendingExpiry
+        }
+
+        let closeAllCountBeforeStop = handler.closeAllCount
         server.sendToAll(
             streamStartFrame(
                 requestId: "request-disconnect",
@@ -692,7 +991,10 @@ private enum SesoriIntegrationTests {
             handler.requests.contains { $0.leaseId == "lease-disconnect" }
         }
         client.stop()
-        try expect(handler.closeAllCount == 1, "disconnect should close pending and active streams")
+        try expect(
+            handler.closeAllCount == closeAllCountBeforeStop + 1,
+            "disconnect should close pending and active streams"
+        )
         handler.complete(
             leaseId: "lease-disconnect",
             with: .started(answer: answer, iceCandidates: [])
@@ -837,6 +1139,31 @@ private enum SesoriIntegrationTests {
         return String(data: frame, encoding: .utf8)!
     }
 
+    private static func malformedTurnFrame(
+        requestId: String,
+        leaseId: String,
+        offer: SesoriRTCDescription
+    ) -> String {
+        let validFrame = streamStartFrame(
+            requestId: requestId,
+            leaseId: leaseId,
+            control: false,
+            offer: offer,
+            iceCandidates: [],
+            turn: nil
+        )
+        let data = validFrame.data(using: .utf8)!
+        var object = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object["turn"] = [
+            "urls": "turn:turn.example.test",
+            "username": "user",
+            "credential": "secret",
+            "expiresAt": 4_000_000_000_000
+        ]
+        let malformed = try! JSONSerialization.data(withJSONObject: object)
+        return String(data: malformed, encoding: .utf8)!
+    }
+
     private static func jsonObject(_ frame: String) throws -> [String: Any] {
         guard let data = frame.data(using: .utf8),
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -917,6 +1244,58 @@ private final class FakeRemoteStreamHandler: SesoriRemoteStreamHandling {
 
     func reportClosed(leaseId: String, reason: SesoriStreamClosedReason) {
         closedHandler(leaseId, reason)
+    }
+}
+
+@MainActor
+private final class StreamStartedSendGate {
+    private(set) var enteredLeaseIds: Set<String> = []
+    private(set) var cancelledLeaseIds: Set<String> = []
+
+    private var blockedLeaseId: String?
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    func blockStreamStarted(leaseId: String) {
+        blockedLeaseId = leaseId
+    }
+
+    func send(
+        socket: URLSessionWebSocketTask,
+        message: URLSessionWebSocketTask.Message
+    ) async throws {
+        if case .string(let frame) = message,
+           let data = frame.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           object["type"] as? String == "streamStarted",
+           let leaseId = object["leaseId"] as? String,
+           leaseId == blockedLeaseId {
+            enteredLeaseIds.insert(leaseId)
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation = $0 }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.cancelBlockedSend(leaseId: leaseId)
+                }
+            }
+            return
+        }
+        try await socket.send(message)
+    }
+
+    func releaseWithFailure() {
+        blockedLeaseId = nil
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume(throwing: URLError(.cancelled))
+    }
+
+    private func cancelBlockedSend(leaseId: String) {
+        guard blockedLeaseId == leaseId else { return }
+        blockedLeaseId = nil
+        cancelledLeaseIds.insert(leaseId)
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume(throwing: CancellationError())
     }
 }
 

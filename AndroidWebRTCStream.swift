@@ -143,6 +143,38 @@ private final class AndroidWebRTCRuntime: @unchecked Sendable {
     }
 }
 
+enum AndroidWebRTCPeerConfiguration {
+    static func make(
+        turn: SesoriTURNConfiguration?,
+        now: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
+    ) -> RTCConfiguration? {
+        let configuration = RTCConfiguration()
+        configuration.sdpSemantics = .unifiedPlan
+        configuration.bundlePolicy = .maxBundle
+        configuration.rtcpMuxPolicy = .require
+
+        if let turn {
+            guard turn.isValid,
+                  let canonicalURLs = turn.canonicalURLs,
+                  turn.expiresAt > now else {
+                return nil
+            }
+            configuration.iceTransportPolicy = .relay
+            configuration.iceServers = [
+                RTCIceServer(
+                    urlStrings: canonicalURLs,
+                    username: turn.username,
+                    credential: turn.credential
+                )
+            ]
+        } else {
+            configuration.iceTransportPolicy = .all
+            configuration.iceServers = []
+        }
+        return configuration
+    }
+}
+
 @MainActor
 private final class AndroidWebRTCPeer: NSObject, RTCPeerConnectionDelegate {
     let deviceKey: String
@@ -243,25 +275,9 @@ private final class AndroidWebRTCPeer: NSObject, RTCPeerConnectionDelegate {
             return
         }
 
-        let configuration = RTCConfiguration()
-        configuration.sdpSemantics = .unifiedPlan
-        configuration.bundlePolicy = .maxBundle
-        configuration.rtcpMuxPolicy = .require
-        configuration.iceTransportPolicy = .all
-        if let turn = request.turn {
-            guard turn.expiresAt > Int64(Date().timeIntervalSince1970 * 1_000) else {
-                failSetup(.peerSetupFailed)
-                return
-            }
-            configuration.iceServers = [
-                RTCIceServer(
-                    urlStrings: turn.urls,
-                    username: turn.username,
-                    credential: turn.credential
-                )
-            ]
-        } else {
-            configuration.iceServers = []
+        guard let configuration = AndroidWebRTCPeerConfiguration.make(turn: request.turn) else {
+            failSetup(.peerSetupFailed)
+            return
         }
 
         guard let peerConnection = factory.peerConnection(

@@ -60,7 +60,15 @@ local canvas continues to work normally.
 
 Claimed Android emulators can publish their existing scrcpy video source to a
 Sesori WebRTC client. The current remote path is video-only: remote control and
-iOS remote video remain unadvertised and fail closed.
+iOS remote video remain unadvertised and fail closed. TURN-bearing stream
+requests require validated `turn:` or `turns:` URLs, use relay-only ICE, and end
+at the earlier of the stream lease or credential expiry. External TURN issuance
+and deployment remain Sesori infrastructure gates. TURN endpoints are restricted
+to canonical DNS, IPv4, or bracketed IPv6 hosts. Scheme and transport casing is
+ignored, omitted ports and transports use the TURN defaults, and accepted URLs
+are canonicalized before libwebrtc receives them. Alternate numeric hosts and
+dotted, compatible, mapped, or translatable IPv4-in-IPv6 forms are rejected,
+as are semantically duplicate URLs.
 
 For a source-run Bridge using `--data-dir`, launch Device Canvas with
 `SESORI_DATA_DIR` set to the same directory.

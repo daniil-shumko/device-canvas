@@ -26,6 +26,7 @@ private enum AndroidWebRTCStreamTests {
     @MainActor
     private static func run() async throws -> Bool {
         let service = AndroidWebRTCService()
+        try testPeerConfigurations()
         let endpoint = AndroidEmulatorStreamEndpoint(serial: "emulator-5554")
         let closedStreams = ClosedStreamRecorder()
         service.setStreamClosedHandler { leaseId, reason in
@@ -145,6 +146,58 @@ private enum AndroidWebRTCStreamTests {
             "unregister must report exactly one stopped callback for the first lease"
         )
         return ranLiveSmoke
+    }
+
+    private static func testPeerConfigurations() throws {
+        let now: Int64 = 1_000
+        guard let direct = AndroidWebRTCPeerConfiguration.make(turn: nil, now: now) else {
+            throw TestFailure("direct peer configuration should be available")
+        }
+        try expect(direct.iceTransportPolicy == .all, "direct peers should gather all candidates")
+        try expect(direct.iceServers.isEmpty, "direct peers should not configure ICE servers")
+
+        let turn = SesoriTURNConfiguration(
+            urls: [
+                "TURN:TURN.EXAMPLE.TEST.:03478?TRANSPORT=UDP",
+                "turns:turn.example.test:5349?transport=tcp",
+                "turns:secure-udp.example.test?transport=udp"
+            ],
+            username: "user",
+            credential: "secret",
+            expiresAt: now + 1_000
+        )
+        guard let relayed = AndroidWebRTCPeerConfiguration.make(turn: turn, now: now) else {
+            throw TestFailure("unexpired TURN peer configuration should be available")
+        }
+        try expect(relayed.iceTransportPolicy == .relay, "TURN peers should gather relay candidates only")
+        try expect(relayed.iceServers.count == 1, "TURN peers should configure one credential set")
+        let server = relayed.iceServers[0]
+        let canonicalURLs = [
+            "turn:turn.example.test:3478?transport=udp",
+            "turns:turn.example.test:5349?transport=tcp",
+            "turns:secure-udp.example.test:5349?transport=udp"
+        ]
+        try expect(
+            server.urlStrings == canonicalURLs,
+            "TURN URLs should reach WebRTC in its canonical supported form"
+        )
+        try expect(server.username == turn.username, "TURN username should reach WebRTC unchanged")
+        try expect(server.credential == turn.credential, "TURN credential should reach WebRTC unchanged")
+        var factory: RTCPeerConnectionFactory? = RTCPeerConnectionFactory()
+        let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        guard let peer = factory?.peerConnection(
+            with: relayed,
+            constraints: constraints,
+            delegate: nil
+        ) else {
+            throw TestFailure("pinned libwebrtc should accept every canonical TURN URL")
+        }
+        peer.close()
+        factory = nil
+        try expect(
+            AndroidWebRTCPeerConfiguration.make(turn: turn, now: turn.expiresAt) == nil,
+            "expired TURN credentials should fail before peer creation"
+        )
     }
 
     @MainActor
