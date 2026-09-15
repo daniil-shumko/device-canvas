@@ -1,6 +1,6 @@
 # Device Hub 27 reverse-engineering notes
 
-## Examined build
+## Original examined build
 
 - Xcode: `27.0 beta 5` (`27A5237l`)
 - Device Hub: `27.0` (`255.114`)
@@ -12,6 +12,53 @@
 trampoline launches the second `arm64e` executable at
 `Contents/MacOS/DeviceHub`. Most of the UI and all live-device presentation
 code is in the 12 MB `DeviceKit` private framework, not in the app executable.
+
+## Xcode 27.0 release validation
+
+Checked on 2026-09-15 with Xcode `27.0` (`27A266a`), Device Hub `27.0`
+(`255.2.6.6`), DeviceKit `255.2.6`, and macOS `26.6.2`.
+
+| iOS 27.0 simulator | Device Hub live view | Device Canvas live view and click input |
+| --- | --- | --- |
+| iPhone 18 Pro | Passed | Passed after sizing fix |
+| iPhone 17 | Passed | Passed after sizing fix |
+| iPhone 17 Pro Max | Passed | Passed after sizing fix |
+
+The existing shim still compiles and links. A successful build was not sufficient:
+Device Canvas's estimated source rectangle cropped the status bar, bezel, and
+bottom of the screen. Device Hub itself displayed the complete devices.
+
+The fix lets `DeviceView` choose its intrinsic size with `fixedSize()`, measures
+that size **before** applying the scale transform, and fits it into the pane.
+This includes DeviceKit's bezel and updates when the device rotates. It removes
+the guessed phone/iPad aspect ratios and the cached initial pane dimensions;
+no framework patch, new private symbol, or device-model size table is needed.
+
+Checks performed:
+
+- `zsh build.sh`: shim/app compilation, Sesori protocol tests, Android WebRTC
+  native tests, and strict app signature verification passed.
+- All three booted devices rendered concurrently in Canvas; each received a
+  mouse click in a temporary UIKit counter app through its own pane.
+- Moving and shrinking the iPhone 17 pane preserved its full screen and correct
+  click coordinates (counter advanced again after the resize).
+- On iPhone 18 Pro, keyboard text and a drag-to-scroll reached the test app
+  through Canvas. Device Hub displayed the same state, accepted another click
+  and text input, and Canvas reflected those changes.
+- Rotating iPhone 18 Pro through Device Hub produced a complete landscape view
+  in Canvas; returning to portrait restored the full portrait view.
+- Removing the test app and shutting down the two initially stopped simulators
+  left their existing apps/data intact. The iPhone 18 Pro remained booted.
+
+Repeat these interactive checks after future Xcode upgrades, including a smaller
+pane and a rotation; compilation alone cannot detect this regression. Keep probe
+apps, screenshots, and logs in ignored `.build/`, not in source control. Probe
+apps built with the iOS 27 SDK must use the UIScene lifecycle.
+
+Standalone SourceKit-LSP cannot resolve `DeviceKit` without the generated shim
+and framework search paths supplied by `build.sh`; use the actual build for
+compiler validation. This pass did not validate physical-device operations or
+live remote Android/TURN sessions.
 
 ## Window architecture
 

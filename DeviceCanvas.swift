@@ -47,14 +47,6 @@ private struct DeviceInfo: Identifiable, Equatable, Sendable {
     let id: DeviceIdentifier
     let name: String
     let runtime: String
-    let screenAspectRatio: CGFloat?
-
-    init(id: DeviceIdentifier, name: String, runtime: String, screenAspectRatio: CGFloat? = nil) {
-        self.id = id
-        self.name = name
-        self.runtime = runtime
-        self.screenAspectRatio = screenAspectRatio
-    }
 
     var shortIdentifier: String {
         switch id {
@@ -93,7 +85,6 @@ private enum IOSSimulatorDiscovery {
         let udid: String
         let state: String
         let isAvailable: Bool?
-        let deviceTypeIdentifier: String
     }
 
     static func bootedSimulators() async throws -> [DeviceInfo] {
@@ -137,8 +128,7 @@ private enum IOSSimulatorDiscovery {
                     simulatorsByIdentifier[identifier] = DeviceInfo(
                         id: .ios(identifier),
                         name: record.name,
-                        runtime: runtime,
-                        screenAspectRatio: record.deviceTypeIdentifier.contains(".iPad-") ? 0.75 : 0.46
+                        runtime: runtime
                     )
                 }
             }
@@ -574,49 +564,25 @@ private struct DeviceWorkspaceView: View {
 
 private struct ScaledDeviceView: View {
     let deviceIdentifier: UUID
-    let screenAspectRatio: CGFloat
 
-    @State private var referenceSize: CGSize?
+    @State private var naturalSize: CGSize = .zero
 
     var body: some View {
         GeometryReader { container in
-            let fittedSize = aspectFit(screenAspectRatio, in: container.size)
-            let sourceSize = referenceSize ?? container.size
-            let naturalSize = aspectFill(screenAspectRatio, in: sourceSize)
-            let widthScale = naturalSize.width > 0 ? fittedSize.width / naturalSize.width : 1
-            let heightScale = naturalSize.height > 0 ? fittedSize.height / naturalSize.height : 1
+            let widthScale = naturalSize.width > 0 ? container.size.width / naturalSize.width : 1
+            let heightScale = naturalSize.height > 0 ? container.size.height / naturalSize.height : 1
 
+            // DeviceKit 27 renders at its intrinsic size, including the bezel.
+            // Constraining it to an estimated phone aspect ratio crops the screen.
+            // Measure before scaling so resizing and rotation preserve the full view.
             DeviceView(deviceIdentifier: deviceIdentifier)
-                .frame(width: naturalSize.width, height: naturalSize.height)
+                .fixedSize()
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+                    naturalSize = size
+                }
                 .scaleEffect(min(widthScale, heightScale))
                 .frame(width: container.size.width, height: container.size.height)
-                .onChange(of: container.size, initial: true) { _, size in
-                    guard referenceSize == nil, size.width > 0, size.height > 0 else {
-                        return
-                    }
-                    referenceSize = size
-                }
         }
-    }
-
-    private func aspectFit(_ aspectRatio: CGFloat, in size: CGSize) -> CGSize {
-        guard size.width > 0, size.height > 0 else {
-            return .zero
-        }
-        if size.width / size.height > aspectRatio {
-            return CGSize(width: size.height * aspectRatio, height: size.height)
-        }
-        return CGSize(width: size.width, height: size.width / aspectRatio)
-    }
-
-    private func aspectFill(_ aspectRatio: CGFloat, in size: CGSize) -> CGSize {
-        guard size.width > 0, size.height > 0 else {
-            return .zero
-        }
-        if size.width / size.height > aspectRatio {
-            return CGSize(width: size.width, height: size.width / aspectRatio)
-        }
-        return CGSize(width: size.height * aspectRatio, height: size.height)
     }
 }
 
@@ -680,10 +646,7 @@ private struct DevicePane: View {
         if isOnline {
             switch device.id {
             case .ios(let identifier):
-                ScaledDeviceView(
-                    deviceIdentifier: identifier,
-                    screenAspectRatio: device.screenAspectRatio ?? 0.46
-                )
+                ScaledDeviceView(deviceIdentifier: identifier)
             case .android(let serial):
                 AndroidEmulatorView(serial: serial, frameSink: androidStreamEndpoint)
             }
