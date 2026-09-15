@@ -7,14 +7,20 @@ screens in one window. It supports booted iOS simulators using Xcode
 27's private `DeviceKit.framework` and running Android Studio emulators using
 the Android SDK's `adb`. It does not modify Xcode, Device Hub, or Android Studio.
 
-Build with the Xcode 27 beta installed at the default path:
+Build with Xcode 27 installed in `/Applications`:
 
 ```sh
 zsh build.sh
 ```
 
 Set `XCODE_APP=/path/to/Xcode.app` if Xcode 27 is installed under a name the
-script cannot discover.
+script cannot discover. Rebuild after changing Xcode installations: the executable
+links to that installation's private frameworks, and `run.sh` only builds when
+its app bundle is absent.
+
+Xcode 27.0 (`27A266a`) has been checked with iOS 27.0 on iPhone 18 Pro,
+iPhone 17, and iPhone 17 Pro Max. See [release validation](RESEARCH.md#xcode-270-release-validation)
+for the checks and the simulator-sizing fix.
 
 The build downloads the pinned stasel/WebRTC 151.0.0 XCFramework into the
 ignored `.build/dependencies` directory and verifies its SHA-256 digest before
